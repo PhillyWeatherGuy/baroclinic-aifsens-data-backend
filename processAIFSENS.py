@@ -41,7 +41,7 @@ MAX_CONCURRENT_PARAMS = 2
 
 # 🌟 Point to the AIFS ENS config file
 CONFIG_FILE_PATH = os.path.join("config", "parametersAIFSENS.json")
-HF_REPO_ID = "PhillyWeatherGuy/baroclinic-aifsens-data-backend"
+HF_REPO_ID = "PhillyWeatherGuy/baroclinic-aifsens-data"
 
 CONTOUR_COORD_SCALE = 1000
 CONTOUR_FORMAT = "CTV2"
