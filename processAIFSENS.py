@@ -549,7 +549,7 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
         return [], 0, 0
 
     frame_h, frame_w = frame_arrays[0].shape[-2:]
-    frames_per_volume = 10
+    frames_per_volume = 1
     num_members = 10
     members_str = "m01-m10"
 
