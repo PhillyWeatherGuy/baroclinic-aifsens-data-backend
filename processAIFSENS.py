@@ -358,7 +358,6 @@ def process_thickness_grib(grib_path, contour_config):
 
     ds.close()
 
-    # Calculate on the mean of the ensemble
     if z500.ndim == 3:
         z500 = np.mean(z500, axis=0)
         z1000 = np.mean(z1000, axis=0)
@@ -389,7 +388,6 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
 
     grib_var = param_config["grib_param"]
     
-    # Wind Speed OR Relative Vorticity calculation
     if "u" in ds and "v" in ds:
         u = np.squeeze(ds["u"].values)
         v = np.squeeze(ds["v"].values)
@@ -437,7 +435,6 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
     elif param_config.get("unit") in {"mb", "hPa"} or str(param_config.get("grib_param", "")).lower() in {"msl", "mslp"}:
         raw_arr_k = raw_arr_k / 100.0
 
-    # Calculate contours on the ensemble mean
     mean_arr = np.mean(raw_arr_k, axis=0) if raw_arr_k.ndim == 3 else raw_arr_k
     contour_levels = extract_contour_levels(
         mean_arr,
@@ -457,17 +454,16 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
 
     grib_p = param_config["grib_param"]
     
-    # 🌟 Fetch ALL 10 members at once!
     retrieve_kwargs = {
         "date": target_date,
         "time": int(chosen_run),
         "step": step,
-        "type": "pf",               # Perturbed Forecast
+        "type": "pf",
         "levtype": param_config.get("levtype", "sfc"),
         "param": grib_p if isinstance(grib_p, list) else [grib_p],
         "target": grib_file,
-        "stream": "enfo",           # Ensemble Stream
-        "number": list(range(1, 11)) # 10 members
+        "stream": "enfo",
+        "number": list(range(1, 11))
     }
 
     if "levelist" in param_config:
@@ -485,7 +481,6 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             raster_config = {**param_config, "contours": []} if has_contours else param_config
             is_interval = bool(param_config.get("interval_hours") or re.search(r'[-_]?(6|24)h(?:r)?$', param_config.get("id", "").lower()))
             
-            # 🌟 Returns an array of shape (10, H, W)
             frame_arr, contour_levels = process_grib_to_array(grib_file, raster_config, target_date=target_date, want_raw=is_interval)
             contour_levels = list(contour_levels)
             ptype_arr = None
@@ -493,7 +488,6 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             try: os.remove(grib_file)
             except Exception: pass
 
-            # Handle contours (calculated on the ensemble mean, see process_grib_to_array)
             if contour_sources:
                 for c_src in contour_sources:
                     c_id = c_src.get("id", c_src.get("grib_param", "contour"))
@@ -561,9 +555,6 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
         chunk_frames = frame_arrays[i:i + frames_per_volume]
         chunk_steps = steps_written[i:i + frames_per_volume]
 
-        # chunk_frames is a list of (10, H, W) arrays.
-        # np.stack gives (10 steps, 10 members, H, W)
-        # We transpose to (10 members, 10 steps, H, W) so the file is strictly bundled by member.
         volume_arr = np.stack(chunk_frames, axis=0).transpose(1, 0, 2, 3)
         
         volume_filename = patterns[pattern_key].format(
@@ -659,7 +650,6 @@ def prune_old_huggingface_runs(repo_id=HF_REPO_ID, days_to_keep=7):
         print(f"  ⚠️ Could not prune old Hugging Face files: {e}")
 
 def run_master_pipeline(selected_param_key="2t"):
-    # 🌟 AIFS Ensemble Model Name
     MODEL_NAME = "aifs_ens"
     param_config = load_parameter_config(selected_param_key)
     patterns = param_config["filename_patterns"]
@@ -698,7 +688,6 @@ def run_master_pipeline(selected_param_key="2t"):
         try: os.remove(f)
         except Exception: pass
 
-    # 🌟 AIFS ENS Client setup
     client = Client(source="azure", model="aifs-ens", resol="0p25")
     os.makedirs(output_dist_dir, exist_ok=True)
 
@@ -744,8 +733,16 @@ def run_master_pipeline(selected_param_key="2t"):
                 prev_arr = results[prev_s] if prev_s is not None else 0.0
 
             diff = np.maximum(0.0, results[s] - prev_arr)
+            
+            # 🌟 FIX: Loop over the 10 member slices when diff is a 3D ensemble array
             if diff.max() > 0:
-                diff = cv2.erode(diff, np.ones((2, 2), np.uint8))
+                if diff.ndim == 3:
+                    for m_idx in range(diff.shape[0]):
+                        if diff[m_idx].max() > 0:
+                            diff[m_idx] = cv2.erode(diff[m_idx], np.ones((2, 2), np.uint8))
+                else:
+                    diff = cv2.erode(diff, np.ones((2, 2), np.uint8))
+
             diff_results[s] = normalize_array(diff, param_config)
         results = diff_results
 
@@ -784,7 +781,6 @@ def run_master_pipeline(selected_param_key="2t"):
                 },
             }
 
-            # Using "m01-m10" in filenames
             run_contour_filename = patterns["run_contours"].format(
                 model=MODEL_NAME, param=param_config["id"], date=target_date, run=CHOSEN_RUN.lower()
             )
@@ -838,7 +834,6 @@ def run_master_pipeline(selected_param_key="2t"):
             fut.result()
     phases["volumes+gzip"] = time.perf_counter() - t0
 
-    # 🌟 Add ensemble metadata to the manifest
     manifest = {
         "model": MODEL_NAME,
         "parameter": param_config["id"],
@@ -852,7 +847,7 @@ def run_master_pipeline(selected_param_key="2t"):
         "members": 10,
         "member_ids": ["m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08", "m09", "m10"],
         "frames_per_member": 10,
-        "member_size_bytes": frame_w * frame_h * 10, # 10 frames per member
+        "member_size_bytes": frame_w * frame_h * 10,
         "total_frames": len(steps_written),
         "frame_width": frame_w,
         "frame_height": frame_h,
