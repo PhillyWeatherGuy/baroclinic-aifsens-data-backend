@@ -549,8 +549,8 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
         return [], 0, 0
 
     frame_h, frame_w = frame_arrays[0].shape[-2:]
+    # 🌟 1 forecast step per file (contains all 10 members for that single step)
     frames_per_volume = 1
-    num_members = 10
     members_str = "m01-m10"
 
     chunks = []
@@ -561,24 +561,27 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
         chunk_frames = frame_arrays[i:i + frames_per_volume]
         chunk_steps = steps_written[i:i + frames_per_volume]
 
-        # chunk_frames is a list of (10, H, W) arrays.
-        # np.stack gives (10 steps, 10 members, H, W)
-        # We transpose to (10 members, 10 steps, H, W) so the file is strictly bundled by member.
+        # chunk_frames has shape (1, 10, H, W)
+        # Transpose to (10 members, 1 step, H, W) so each member is stored as a contiguous 1-frame block
         volume_arr = np.stack(chunk_frames, axis=0).transpose(1, 0, 2, 3)
         
+        step_val = chunk_steps[0] if chunk_steps else 0
         volume_filename = patterns[pattern_key].format(
             model=model_name,
             param=param_config["id"],
             date=target_date,
             run=chosen_run,
             members=members_str,
-            chunk_idx=chunk_idx
+            chunk_idx=chunk_idx,
+            step=step_val,
+            step_z3=f"{step_val:03d}"
         )
 
         chunk_manifest = {
             "file": volume_filename,
             "forecast_steps": chunk_steps,
-            "frame_count": len(chunk_frames)
+            "frame_count": len(chunk_frames),
+            "member_size_bytes": frame_w * frame_h  # 🌟 1 frame per member
         }
         chunk_entry = {
             "array": volume_arr,
@@ -851,8 +854,8 @@ def run_master_pipeline(selected_param_key="2t"):
         "type": "ensemble_chunked",
         "members": 10,
         "member_ids": ["m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08", "m09", "m10"],
-        "frames_per_member": 10,
-        "member_size_bytes": frame_w * frame_h * 10, # 10 frames per member
+        "frames_per_member": 1,                       # 🌟 1 frame per member
+        "member_size_bytes": frame_w * frame_h,       # 🌟 1 frame size per member
         "total_frames": len(steps_written),
         "frame_width": frame_w,
         "frame_height": frame_h,
