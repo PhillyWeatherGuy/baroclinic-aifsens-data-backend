@@ -451,9 +451,13 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
 def fetch_and_process_step(client, target_date, chosen_run, step, param_config, model_name):
     patterns = param_config["filename_patterns"]
     grib_file = patterns["grib"].format(model=model_name, param=param_config["id"], step=step)
-
     grib_p = param_config["grib_param"]
     
+    # 🌟 Precipitation at Step 0 is always 0.0 (no accumulation yet)
+    if step == 0 and param_config.get("grib_param") == "tp":
+        zero_frame = np.zeros((10, 721, 1440), dtype=np.float32)
+        return step, zero_frame, pack_step([]), None
+
     retrieve_kwargs = {
         "date": target_date,
         "time": int(chosen_run),
@@ -488,7 +492,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             try: os.remove(grib_file)
             except Exception: pass
 
-            # 🌟 AIFS Specific Ptype Derivation
+            # 🌟 AIFS-ENS Specific Ptype Derivation
             ptype_source = param_config.get("ptype_source")
             if ptype_source:
                 if param_config["id"] == "prate":
@@ -510,10 +514,9 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             )
                         
                         if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
-                            # Load 2m Temp (Shape: 10, lat, lon)
+                            # Load 2m Temp
                             ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
                             
-                            # 🌟 FIX: Sort t2m to match the main precipitation array
                             if 'lon' in ds_2t.coords: ds_2t = ds_2t.rename({'lon': 'longitude'})
                             if 'lat' in ds_2t.coords: ds_2t = ds_2t.rename({'lat': 'latitude'})
                             ds_2t = ds_2t.sortby('latitude', ascending=False)
@@ -523,10 +526,9 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             t2m_var = next(iter(ds_2t.data_vars))
                             t2m_da = ds_2t[t2m_var].squeeze()
                             
-                            # Load Pressure Level Temps (Shape: 10, levels, lat, lon)
+                            # Load Pressure Level Temps
                             ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
                             
-                            # 🌟 FIX: Sort t_pl to match the main precipitation array
                             if 'lon' in ds_t.coords: ds_t = ds_t.rename({'lon': 'longitude'})
                             if 'lat' in ds_t.coords: ds_t = ds_t.rename({'lat': 'latitude'})
                             ds_t = ds_t.sortby('latitude', ascending=False)
@@ -539,28 +541,22 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             level_dim = next((dim for dim in t_pl_da.dims if 'isobaric' in dim.lower() or 'level' in dim.lower()), None)
                             if level_dim:
                                 t_pl_da = t_pl_da.where((t_pl_da > 100) & (t_pl_da < 350))
-                                max_col_t = t_pl_da.max(dim=level_dim) # Reduces to (10, lat, lon)
+                                max_col_t = t_pl_da.max(dim=level_dim) 
                             else:
                                 max_col_t = t_pl_da.max(dim=t_pl_da.dims[1])
                                 
-                            # Create ptype array (10, lat, lon)
+                            # Create ptype array
                             ptype_arr = np.zeros_like(t2m_da.values, dtype=np.uint8)
                             
-                            # Rule 1: Rain (1) if surface > 273.15K
                             rain_mask = t2m_da.values > 273.15
                             ptype_arr[rain_mask] = 1
                             
-                            # Rule 2 & 3: Cold surface
                             surf_freeze = ~rain_mask
                             warm_nose = max_col_t.values > 273.15
                             
-                            # Mix (3) if surface is freezing but aloft is warm
                             ptype_arr[surf_freeze & warm_nose] = 3
-                            
-                            # Snow (5) if surface and aloft are freezing
                             ptype_arr[surf_freeze & ~warm_nose] = 5
                             
-                            # Mask out ptype where there is no precipitation (frame_arr is 10, lat, lon)
                             if frame_arr is not None:
                                 ptype_arr[frame_arr == 0] = 0
                             
@@ -642,6 +638,8 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
     for chunk_idx, i in enumerate(range(0, len(frame_arrays), frames_per_volume)):
         chunk_frames = frame_arrays[i:i + frames_per_volume]
         chunk_steps = steps_written[i:i + frames_per_volume]
+        
+        # 🌟 Re-added ptype extraction for the chunk
         chunk_ptype = ptype_arrays[i:i + frames_per_volume] if ptype_arrays else None
 
         volume_arr = np.stack(chunk_frames, axis=0).transpose(1, 0, 2, 3)
