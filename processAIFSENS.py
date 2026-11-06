@@ -31,7 +31,7 @@ MANUAL_RUN_DATE = None
 MANUAL_RUN_CYCLE = None
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
-FORECAST_STEPS = list(range(0, 25, 6))
+FORECAST_STEPS = list(range(0, 37, 6))
 
 MAX_TEXTURE_SIZE = 4096
 MAX_CONCURRENT_WORKERS = int(os.environ.get("MAX_WORKERS", "12"))
@@ -335,6 +335,9 @@ def get_climatology_grid(param_id, target_date=None, target_shape=(721, 1440), u
 def process_thickness_grib(grib_path, contour_config):
     ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
 
+    # 🌟 FIX: Guarantee members are identically sorted for ensemble sync
+    if 'number' in ds.coords: ds = ds.sortby('number')
+
     if 'lon' in ds.coords:
         ds = ds.rename({'lon': 'longitude'})
     if 'lat' in ds.coords:
@@ -373,6 +376,9 @@ def process_thickness_grib(grib_path, contour_config):
 @timed("decode_all")
 def process_grib_to_array(grib_path, param_config, want_raster=True, target_date=None, want_raw=False):
     ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+
+    # 🌟 FIX: Guarantee members are identically sorted for ensemble sync
+    if 'number' in ds.coords: ds = ds.sortby('number')
 
     if 'lon' in ds.coords:
         ds = ds.rename({'lon': 'longitude'})
@@ -453,10 +459,12 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
     grib_file = patterns["grib"].format(model=model_name, param=param_config["id"], step=step)
     grib_p = param_config["grib_param"]
     
-    # 🌟 Precipitation at Step 0 is always 0.0 (no accumulation yet)
+    # 🌟 FIX: Precipitation at Step 0 is always 0.0 (no accumulation yet)
+    # Must return a valid zeros array for ptype to satisfy build_volume_chunks
     if step == 0 and param_config.get("grib_param") == "tp":
         zero_frame = np.zeros((10, 721, 1440), dtype=np.float32)
-        return step, zero_frame, pack_step([]), None
+        zero_ptype = np.zeros((10, 721, 1440), dtype=np.uint8)
+        return step, zero_frame, pack_step([]), zero_ptype
 
     retrieve_kwargs = {
         "date": target_date,
@@ -500,13 +508,11 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                     t_pl_file = f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2"
                     try:
                         with tm("download_ptype"):
-                            # Fetch 2t (Surface) for all 10 members
                             client.retrieve(
                                 date=target_date, time=int(chosen_run), step=step, 
                                 stream="enfo", type="pf", levtype="sfc", param=["2t"], 
                                 number=list(range(1, 11)), target=t2m_file
                             )
-                            # Fetch t at 850, 700, 500 mb for all 10 members
                             client.retrieve(
                                 date=target_date, time=int(chosen_run), step=step, 
                                 stream="enfo", type="pf", levtype="pl", levelist=[850, 700, 500], param=["t"], 
@@ -514,8 +520,10 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             )
                         
                         if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
-                            # Load 2m Temp
                             ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            
+                            # 🌟 FIX: Sort by member index to guarantee lockstep
+                            if 'number' in ds_2t.coords: ds_2t = ds_2t.sortby('number')
                             
                             if 'lon' in ds_2t.coords: ds_2t = ds_2t.rename({'lon': 'longitude'})
                             if 'lat' in ds_2t.coords: ds_2t = ds_2t.rename({'lat': 'latitude'})
@@ -526,8 +534,10 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             t2m_var = next(iter(ds_2t.data_vars))
                             t2m_da = ds_2t[t2m_var].squeeze()
                             
-                            # Load Pressure Level Temps
                             ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            
+                            # 🌟 FIX: Sort by member index
+                            if 'number' in ds_t.coords: ds_t = ds_t.sortby('number')
                             
                             if 'lon' in ds_t.coords: ds_t = ds_t.rename({'lon': 'longitude'})
                             if 'lat' in ds_t.coords: ds_t = ds_t.rename({'lat': 'latitude'})
@@ -545,7 +555,6 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             else:
                                 max_col_t = t_pl_da.max(dim=t_pl_da.dims[1])
                                 
-                            # Create ptype array
                             ptype_arr = np.zeros_like(t2m_da.values, dtype=np.uint8)
                             
                             rain_mask = t2m_da.values > 273.15
@@ -638,8 +647,6 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
     for chunk_idx, i in enumerate(range(0, len(frame_arrays), frames_per_volume)):
         chunk_frames = frame_arrays[i:i + frames_per_volume]
         chunk_steps = steps_written[i:i + frames_per_volume]
-        
-        # 🌟 Re-added ptype extraction for the chunk
         chunk_ptype = ptype_arrays[i:i + frames_per_volume] if ptype_arrays else None
 
         volume_arr = np.stack(chunk_frames, axis=0).transpose(1, 0, 2, 3)
@@ -663,7 +670,6 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
             "manifest_data": chunk_manifest
         }
         
-        # 🌟 Stack and transpose ptype to match main array layout (members, steps, lat, lon)
         if chunk_ptype and all(frame is not None for frame in chunk_ptype):
             ptype_filename = volume_filename.replace("_volume_", "_ptype_volume_")
             ptype_stacked = np.stack(chunk_ptype, axis=0).transpose(1, 0, 2, 3)
