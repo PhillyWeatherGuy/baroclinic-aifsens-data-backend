@@ -38,6 +38,7 @@
       "interval_hours": 6,
       "levtype": "sfc",
       "type": "pf",
+      "ptype_source": "derived", 
       "unit": "in/hr",
       "scaling": {
         "mode": "piecewise",
