@@ -30,8 +30,8 @@ sys.stdout.reconfigure(line_buffering=True)  # so log timestamps match reality
 MANUAL_RUN_DATE = None
 MANUAL_RUN_CYCLE = None
 
-# 🌟 AIFS Ensemble: 6-hourly to 360h.
-FORECAST_STEPS = list(range(0, 361, 6))
+# 🌟 AIFS Ensemble: 6-hourly to F024
+FORECAST_STEPS = list(range(0, 25, 6))
 
 MAX_TEXTURE_SIZE = 4096
 MAX_CONCURRENT_WORKERS = int(os.environ.get("MAX_WORKERS", "12"))
@@ -512,11 +512,27 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                         if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
                             # Load 2m Temp (Shape: 10, lat, lon)
                             ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            
+                            # 🌟 FIX: Sort t2m to match the main precipitation array
+                            if 'lon' in ds_2t.coords: ds_2t = ds_2t.rename({'lon': 'longitude'})
+                            if 'lat' in ds_2t.coords: ds_2t = ds_2t.rename({'lat': 'latitude'})
+                            ds_2t = ds_2t.sortby('latitude', ascending=False)
+                            if ds_2t.longitude.max() > 180:
+                                ds_2t = ds_2t.assign_coords(longitude=(((ds_2t.longitude + 180) % 360) - 180)).sortby('longitude')
+                                
                             t2m_var = next(iter(ds_2t.data_vars))
                             t2m_da = ds_2t[t2m_var].squeeze()
                             
                             # Load Pressure Level Temps (Shape: 10, levels, lat, lon)
                             ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            
+                            # 🌟 FIX: Sort t_pl to match the main precipitation array
+                            if 'lon' in ds_t.coords: ds_t = ds_t.rename({'lon': 'longitude'})
+                            if 'lat' in ds_t.coords: ds_t = ds_t.rename({'lat': 'latitude'})
+                            ds_t = ds_t.sortby('latitude', ascending=False)
+                            if ds_t.longitude.max() > 180:
+                                ds_t = ds_t.assign_coords(longitude=(((ds_t.longitude + 180) % 360) - 180)).sortby('longitude')
+                                
                             t_var = next(iter(ds_t.data_vars))
                             t_pl_da = ds_t[t_var].squeeze()
                             
