@@ -31,7 +31,7 @@ MANUAL_RUN_DATE = None
 MANUAL_RUN_CYCLE = None
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
-FORECAST_STEPS = list(range(0, 61, 6))
+FORECAST_STEPS = list(range(0, 361, 6))
 
 MAX_TEXTURE_SIZE = 4096
 MAX_CONCURRENT_WORKERS = int(os.environ.get("MAX_WORKERS", "12"))
