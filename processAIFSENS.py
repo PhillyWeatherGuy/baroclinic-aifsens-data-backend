@@ -335,7 +335,6 @@ def get_climatology_grid(param_id, target_date=None, target_shape=(721, 1440), u
 def process_thickness_grib(grib_path, contour_config):
     ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
 
-    # 🌟 FIX: Guarantee members are identically sorted for ensemble sync
     if 'number' in ds.coords: ds = ds.sortby('number')
 
     if 'lon' in ds.coords:
@@ -361,23 +360,29 @@ def process_thickness_grib(grib_path, contour_config):
 
     ds.close()
 
+    # 🌟 Extract thickness per member without collapsing to ensemble mean
     if z500.ndim == 3:
-        z500 = np.mean(z500, axis=0)
-        z1000 = np.mean(z1000, axis=0)
+        thickness_dam = (z500 - z1000) / 98.0665
+        return [
+            extract_contour_levels(
+                thickness_dam[m],
+                contour_config.get("contours", []),
+                contour_config.get("contours_settings")
+            )
+            for m in range(thickness_dam.shape[0])
+        ]
 
     thickness_dam = (z500 - z1000) / 98.0665
-
-    return extract_contour_levels(
+    return [extract_contour_levels(
         thickness_dam,
         contour_config.get("contours", []),
         contour_config.get("contours_settings")
-    )
+    )]
 
 @timed("decode_all")
 def process_grib_to_array(grib_path, param_config, want_raster=True, target_date=None, want_raw=False):
     ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
 
-    # 🌟 FIX: Guarantee members are identically sorted for ensemble sync
     if 'number' in ds.coords: ds = ds.sortby('number')
 
     if 'lon' in ds.coords:
@@ -441,12 +446,22 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
     elif param_config.get("unit") in {"mb", "hPa"} or str(param_config.get("grib_param", "")).lower() in {"msl", "mslp"}:
         raw_arr_k = raw_arr_k / 100.0
 
-    mean_arr = np.mean(raw_arr_k, axis=0) if raw_arr_k.ndim == 3 else raw_arr_k
-    contour_levels = extract_contour_levels(
-        mean_arr,
-        param_config.get("contours", []),
-        param_config.get("contours_settings")
-    )
+    # 🌟 Extract contours for EACH member rather than averaging across axis=0
+    if raw_arr_k.ndim == 3:
+        contour_levels = [
+            extract_contour_levels(
+                raw_arr_k[m],
+                param_config.get("contours", []),
+                param_config.get("contours_settings")
+            )
+            for m in range(raw_arr_k.shape[0])
+        ]
+    else:
+        contour_levels = [extract_contour_levels(
+            raw_arr_k,
+            param_config.get("contours", []),
+            param_config.get("contours_settings")
+        )]
 
     if want_raw:
         return np.nan_to_num(raw_arr_k, nan=0.0).astype(np.float32), contour_levels
@@ -459,12 +474,11 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
     grib_file = patterns["grib"].format(model=model_name, param=param_config["id"], step=step)
     grib_p = param_config["grib_param"]
     
-    # 🌟 FIX: Precipitation at Step 0 is always 0.0 (no accumulation yet)
-    # Must return a valid zeros array for ptype to satisfy build_volume_chunks
     if step == 0 and param_config.get("grib_param") == "tp":
         zero_frame = np.zeros((10, 721, 1440), dtype=np.float32)
         zero_ptype = np.zeros((10, 721, 1440), dtype=np.uint8)
-        return step, zero_frame, pack_step([]), zero_ptype
+        zero_packed = [pack_step([]) for _ in range(10)]
+        return step, zero_frame, zero_packed, zero_ptype
 
     retrieve_kwargs = {
         "date": target_date,
@@ -493,8 +507,14 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             raster_config = {**param_config, "contours": []} if has_contours else param_config
             is_interval = bool(param_config.get("interval_hours") or re.search(r'[-_]?(6|24)h(?:r)?$', param_config.get("id", "").lower()))
             
-            frame_arr, contour_levels = process_grib_to_array(grib_file, raster_config, target_date=target_date, want_raw=is_interval)
-            contour_levels = list(contour_levels)
+            frame_arr, raw_contour_levels = process_grib_to_array(grib_file, raster_config, target_date=target_date, want_raw=is_interval)
+            
+            # Ensure contour_levels is a list of lists (one per member)
+            if raw_contour_levels and not isinstance(raw_contour_levels[0], list):
+                contour_levels = [list(raw_contour_levels)]
+            else:
+                contour_levels = [list(m_l) for m_l in raw_contour_levels]
+
             ptype_arr = None
 
             try: os.remove(grib_file)
@@ -521,10 +541,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                         
                         if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
                             ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-                            
-                            # 🌟 FIX: Sort by member index to guarantee lockstep
                             if 'number' in ds_2t.coords: ds_2t = ds_2t.sortby('number')
-                            
                             if 'lon' in ds_2t.coords: ds_2t = ds_2t.rename({'lon': 'longitude'})
                             if 'lat' in ds_2t.coords: ds_2t = ds_2t.rename({'lat': 'latitude'})
                             ds_2t = ds_2t.sortby('latitude', ascending=False)
@@ -535,10 +552,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             t2m_da = ds_2t[t2m_var].squeeze()
                             
                             ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-                            
-                            # 🌟 FIX: Sort by member index
                             if 'number' in ds_t.coords: ds_t = ds_t.sortby('number')
-                            
                             if 'lon' in ds_t.coords: ds_t = ds_t.rename({'lon': 'longitude'})
                             if 'lat' in ds_t.coords: ds_t = ds_t.rename({'lat': 'latitude'})
                             ds_t = ds_t.sortby('latitude', ascending=False)
@@ -611,7 +625,15 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                                 _, levels = process_grib_to_array(
                                     c_grib_file, c_cfg, want_raster=False, target_date=target_date
                                 )
-                            contour_levels.extend(levels)
+
+                            if levels and not isinstance(levels[0], list):
+                                levels = [levels]
+
+                            for m_idx, m_lev in enumerate(levels):
+                                if m_idx < len(contour_levels):
+                                    contour_levels[m_idx].extend(m_lev)
+                                else:
+                                    contour_levels.append(m_lev)
                     except Exception as e:
                         print(f"  ❌ [{param_config['id']}] Contour error ({c_id}) F{step:03d}: {e}")
                     finally:
@@ -619,7 +641,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             try: os.remove(c_grib_file)
                             except Exception: pass
 
-            packed = pack_step(contour_levels)
+            packed = [pack_step(m_lev) for m_lev in contour_levels]
 
             print(f"  ⚡ [{param_config['id']}] Processed F{step:03d}")
             return step, frame_arr, packed, ptype_arr
@@ -806,7 +828,7 @@ def run_master_pipeline(selected_param_key="2t"):
             step, arr, packed, ptype_arr = future.result()
             if arr is not None:
                 results[step] = arr
-                if packed and packed["props"]:
+                if packed:
                     contour_steps[step] = packed
                 if ptype_arr is not None:
                     ptype_results[step] = ptype_arr
@@ -856,7 +878,42 @@ def run_master_pipeline(selected_param_key="2t"):
 
     t0 = time.perf_counter()
     if contour_steps and "run_contours" in patterns:
-        contour_binary = assemble_contour_file(contour_steps)
+        # 🌟 Unpack members into binary steps (step*1000 + member) and JSON steps ("step_m{member}")
+        flat_binary_steps = {}
+        json_steps = {}
+
+        for step in sorted(contour_steps):
+            member_pack_list = contour_steps[step]
+            if isinstance(member_pack_list, list):
+                for m, m_pack in enumerate(member_pack_list):
+                    bin_step_id = (step * 1000) + m
+                    flat_binary_steps[bin_step_id] = m_pack
+                    json_steps[f"{step}_m{m}"] = {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {"type": "MultiLineString", "coordinates": []},
+                                "properties": props,
+                            }
+                            for props in m_pack["props"]
+                        ],
+                    }
+            else:
+                flat_binary_steps[step] = member_pack_list
+                json_steps[str(step)] = {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "geometry": {"type": "MultiLineString", "coordinates": []},
+                            "properties": props,
+                        }
+                        for props in member_pack_list["props"]
+                    ],
+                }
+
+        contour_binary = assemble_contour_file(flat_binary_steps)
         compressed_contours = gzip.compress(contour_binary, compresslevel=6)
 
         if len(compressed_contours) >= 100:
@@ -865,20 +922,9 @@ def run_master_pipeline(selected_param_key="2t"):
                 "parameter": param_config["id"],
                 "run": f"{CHOSEN_RUN}z",
                 "date": target_date,
-                "steps": {
-                    str(step): {
-                        "type": "FeatureCollection",
-                        "features": [
-                            {
-                                "type": "Feature",
-                                "geometry": {"type": "MultiLineString", "coordinates": []},
-                                "properties": props,
-                            }
-                            for props in contour_steps[step]["props"]
-                        ],
-                    }
-                    for step in sorted(contour_steps)
-                },
+                "members": 10,
+                "type": "ensemble",
+                "steps": json_steps,
             }
 
             run_contour_filename = patterns["run_contours"].format(
