@@ -488,6 +488,78 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             try: os.remove(grib_file)
             except Exception: pass
 
+            # 🌟 AIFS Specific Ptype Derivation
+            ptype_source = param_config.get("ptype_source")
+            if ptype_source:
+                if param_config["id"] == "prate":
+                    t2m_file = f"{model_name}_{param_config['id']}_2t_{step:03d}.grib2"
+                    t_pl_file = f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2"
+                    try:
+                        with tm("download_ptype"):
+                            # Fetch 2t (Surface) for all 10 members
+                            client.retrieve(
+                                date=target_date, time=int(chosen_run), step=step, 
+                                stream="enfo", type="pf", levtype="sfc", param=["2t"], 
+                                number=list(range(1, 11)), target=t2m_file
+                            )
+                            # Fetch t at 850, 700, 500 mb for all 10 members
+                            client.retrieve(
+                                date=target_date, time=int(chosen_run), step=step, 
+                                stream="enfo", type="pf", levtype="pl", levelist=[850, 700, 500], param=["t"], 
+                                number=list(range(1, 11)), target=t_pl_file
+                            )
+                        
+                        if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
+                            # Load 2m Temp (Shape: 10, lat, lon)
+                            ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            t2m_var = next(iter(ds_2t.data_vars))
+                            t2m_da = ds_2t[t2m_var].squeeze()
+                            
+                            # Load Pressure Level Temps (Shape: 10, levels, lat, lon)
+                            ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            t_var = next(iter(ds_t.data_vars))
+                            t_pl_da = ds_t[t_var].squeeze()
+                            
+                            level_dim = next((dim for dim in t_pl_da.dims if 'isobaric' in dim.lower() or 'level' in dim.lower()), None)
+                            if level_dim:
+                                t_pl_da = t_pl_da.where((t_pl_da > 100) & (t_pl_da < 350))
+                                max_col_t = t_pl_da.max(dim=level_dim) # Reduces to (10, lat, lon)
+                            else:
+                                max_col_t = t_pl_da.max(dim=t_pl_da.dims[1])
+                                
+                            # Create ptype array (10, lat, lon)
+                            ptype_arr = np.zeros_like(t2m_da.values, dtype=np.uint8)
+                            
+                            # Rule 1: Rain (1) if surface > 273.15K
+                            rain_mask = t2m_da.values > 273.15
+                            ptype_arr[rain_mask] = 1
+                            
+                            # Rule 2 & 3: Cold surface
+                            surf_freeze = ~rain_mask
+                            warm_nose = max_col_t.values > 273.15
+                            
+                            # Mix (3) if surface is freezing but aloft is warm
+                            ptype_arr[surf_freeze & warm_nose] = 3
+                            
+                            # Snow (5) if surface and aloft are freezing
+                            ptype_arr[surf_freeze & ~warm_nose] = 5
+                            
+                            # Mask out ptype where there is no precipitation (frame_arr is 10, lat, lon)
+                            if frame_arr is not None:
+                                ptype_arr[frame_arr == 0] = 0
+                            
+                            ds_2t.close()
+                            ds_t.close()
+                    except Exception as e:
+                        print(f"  ⚠️ [{param_config['id']}] AIFS Ptype derivation failed F{step:03d}: {e}")
+                    finally:
+                        if os.path.exists(t2m_file): 
+                            try: os.remove(t2m_file)
+                            except: pass
+                        if os.path.exists(t_pl_file): 
+                            try: os.remove(t_pl_file)
+                            except: pass
+
             if contour_sources:
                 for c_src in contour_sources:
                     c_id = c_src.get("id", c_src.get("grib_param", "contour"))
@@ -554,6 +626,7 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
     for chunk_idx, i in enumerate(range(0, len(frame_arrays), frames_per_volume)):
         chunk_frames = frame_arrays[i:i + frames_per_volume]
         chunk_steps = steps_written[i:i + frames_per_volume]
+        chunk_ptype = ptype_arrays[i:i + frames_per_volume] if ptype_arrays else None
 
         volume_arr = np.stack(chunk_frames, axis=0).transpose(1, 0, 2, 3)
         
@@ -575,6 +648,14 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
             "array": volume_arr,
             "manifest_data": chunk_manifest
         }
+        
+        # 🌟 Stack and transpose ptype to match main array layout (members, steps, lat, lon)
+        if chunk_ptype and all(frame is not None for frame in chunk_ptype):
+            ptype_filename = volume_filename.replace("_volume_", "_ptype_volume_")
+            ptype_stacked = np.stack(chunk_ptype, axis=0).transpose(1, 0, 2, 3)
+            chunk_entry["ptype_array"] = ptype_stacked.astype(np.uint8)
+            chunk_manifest["ptype_file"] = ptype_filename
+            
         chunks.append(chunk_entry)
 
     return chunks, frame_w, frame_h
@@ -734,7 +815,6 @@ def run_master_pipeline(selected_param_key="2t"):
 
             diff = np.maximum(0.0, results[s] - prev_arr)
             
-            # 🌟 FIX: Loop over the 10 member slices when diff is a 3D ensemble array
             if diff.max() > 0:
                 if diff.ndim == 3:
                     for m_idx in range(diff.shape[0]):
@@ -827,6 +907,14 @@ def run_master_pipeline(selected_param_key="2t"):
 
             if filename.endswith(".bin"):
                 gz_futures.append(gz_pool.submit(_gzip_to_file, filepath, chunk["array"].tobytes()))
+                
+                ptype_filename = chunk["manifest_data"].get("ptype_file")
+                if ptype_filename and "ptype_array" in chunk:
+                    gz_futures.append(gz_pool.submit(
+                        _gzip_to_file,
+                        os.path.join(output_dist_dir, ptype_filename),
+                        chunk["ptype_array"].tobytes(),
+                    ))
 
             manifest_chunks.append(chunk["manifest_data"])
 
