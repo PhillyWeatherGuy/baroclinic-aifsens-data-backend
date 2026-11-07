@@ -19,16 +19,52 @@ import rioxarray
 from rasterio.enums import Resampling
 import boto3
 import contourpy
-import gzip
 import struct
+
+# 🌟 Fast Gzip via ISA-L (fallback to standard gzip if not installed)
+try:
+    from isal import igzip as gzip_lib
+except ImportError:
+    import gzip as gzip_lib
+
+# 🌟 RAM disk (/dev/shm) on Linux runners for zero disk I/O latency
+TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK) else "."
+
+# 🌟 DYNAMIC MEMBER RANGE CONFIGURATION
+# Defaults to '1-10', can be overridden via MEMBER_RANGE env var or '--members X-Y' CLI arg
+MEMBER_RANGE = os.environ.get("MEMBER_RANGE", "1-10")
+
+for arg in list(sys.argv):
+    if arg.startswith("--members="):
+        MEMBER_RANGE = arg.split("=", 1)[1]
+        sys.argv.remove(arg)
+    elif arg == "--members":
+        idx = sys.argv.index(arg)
+        if idx + 1 < len(sys.argv):
+            MEMBER_RANGE = sys.argv[idx + 1]
+            sys.argv.pop(idx + 1)
+        sys.argv.pop(idx)
+
+def parse_member_range(range_str):
+    m = re.match(r"^(\d+)-(\d+)$", range_str.strip())
+    if m:
+        return list(range(int(m.group(1)), int(m.group(2)) + 1))
+    if "," in range_str:
+        return [int(x.strip()) for x in range_str.split(",")]
+    return list(range(1, 11))
+
+MEMBER_LIST = parse_member_range(MEMBER_RANGE)
+NUM_MEMBERS = len(MEMBER_LIST)
+MEMBERS_STR = f"m{MEMBER_LIST[0]:02d}-m{MEMBER_LIST[-1]:02d}"
+MEMBER_IDS = [f"m{i:02d}" for i in MEMBER_LIST]
 
 os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
 os.environ.setdefault("TQDM_DISABLE", "1")   # silence download progress bars (best effort)
 sys.stdout.reconfigure(line_buffering=True)  # so log timestamps match reality
 
 # 🌟 MANUAL RUN OVERRIDE (Set to None to automatically fetch the latest run)
-MANUAL_RUN_DATE = 20261106
-MANUAL_RUN_CYCLE = 18
+MANUAL_RUN_DATE = 20261107
+MANUAL_RUN_CYCLE = 12
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
 FORECAST_STEPS = list(range(0, 361, 6))
@@ -78,7 +114,7 @@ def timed(key):
 
 def _gzip_to_file(path, raw_bytes):
     with open(path, "wb") as f:
-        f.write(gzip.compress(raw_bytes, compresslevel=GZIP_LEVEL))
+        f.write(gzip_lib.compress(raw_bytes, compresslevel=GZIP_LEVEL))
 
 def _print_timing(pid, phases, total):
     ph = " | ".join(f"{k} {v:.1f}s" for k, v in phases.items())
@@ -93,6 +129,34 @@ def load_parameter_config(param_key="2t"):
             if param_key in params:
                 return params[param_key]
     raise FileNotFoundError(f"Parameter '{param_key}' not found in {CONFIG_FILE_PATH}")
+
+# ---------------------------------------------------------------------------
+# Fast NumPy Grid Reorientation (Bypasses slow xarray sortby / assign_coords)
+# ---------------------------------------------------------------------------
+def _reorient_dataset_array(da, ds):
+    arr = np.squeeze(da.values)
+    
+    # 1. Sort ensemble members if present
+    if 'number' in ds.coords:
+        nums = ds['number'].values
+        if len(nums) > 1 and not np.all(np.diff(nums) >= 0):
+            arr = arr[np.argsort(nums)]
+            
+    # 2. Ensure latitude is descending (90 -> -90)
+    lat_name = 'latitude' if 'latitude' in ds.coords else ('lat' if 'lat' in ds.coords else None)
+    if lat_name is not None:
+        lats = ds[lat_name].values
+        if len(lats) > 1 and lats[0] < lats[-1]:
+            arr = np.flip(arr, axis=-2)
+            
+    # 3. Ensure longitude is [-180, 180) via fast NumPy roll
+    lon_name = 'longitude' if 'longitude' in ds.coords else ('lon' if 'lon' in ds.coords else None)
+    if lon_name is not None:
+        lons = ds[lon_name].values
+        if len(lons) > 1 and np.nanmax(lons) > 180:
+            arr = np.roll(arr, arr.shape[-1] // 2, axis=-1)
+            
+    return arr
 
 # ---------------------------------------------------------------------------
 # Contours: vectorized extraction + CTV2 binary packing
@@ -333,18 +397,7 @@ def get_climatology_grid(param_id, target_date=None, target_shape=(721, 1440), u
 
 @timed("decode_all")
 def process_thickness_grib(grib_path, contour_config):
-    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-
-    if 'number' in ds.coords: ds = ds.sortby('number')
-
-    if 'lon' in ds.coords:
-        ds = ds.rename({'lon': 'longitude'})
-    if 'lat' in ds.coords:
-        ds = ds.rename({'lat': 'latitude'})
-
-    ds = ds.sortby('latitude', ascending=False)
-    if ds.longitude.max() > 180:
-        ds = ds.assign_coords(longitude=(((ds.longitude + 180) % 360) - 180)).sortby('longitude')
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
 
     target_var = "z" if "z" in ds else list(ds.data_vars)[0]
     da = ds[target_var]
@@ -352,11 +405,11 @@ def process_thickness_grib(grib_path, contour_config):
     level_coord = next((c for c in da.coords if 'isobaric' in c.lower() or 'level' in c.lower()), None)
 
     if level_coord:
-        z500 = da.sel({level_coord: 500}).values.squeeze()
-        z1000 = da.sel({level_coord: 1000}).values.squeeze()
+        z500 = _reorient_dataset_array(da.sel({level_coord: 500}), ds)
+        z1000 = _reorient_dataset_array(da.sel({level_coord: 1000}), ds)
     else:
-        raw_vals = da.values
-        z500, z1000 = raw_vals[0].squeeze(), raw_vals[1].squeeze()
+        z500 = _reorient_dataset_array(da[0], ds)
+        z1000 = _reorient_dataset_array(da[1], ds)
 
     ds.close()
 
@@ -381,31 +434,22 @@ def process_thickness_grib(grib_path, contour_config):
 
 @timed("decode_all")
 def process_grib_to_array(grib_path, param_config, want_raster=True, target_date=None, want_raw=False):
-    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-
-    if 'number' in ds.coords: ds = ds.sortby('number')
-
-    if 'lon' in ds.coords:
-        ds = ds.rename({'lon': 'longitude'})
-    if 'lat' in ds.coords:
-        ds = ds.rename({'lat': 'latitude'})
-
-    ds = ds.sortby('latitude', ascending=False)
-
-    if ds.longitude.max() > 180:
-        ds = ds.assign_coords(
-            longitude=(((ds.longitude + 180) % 360) - 180)
-        ).sortby('longitude')
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
 
     grib_var = param_config["grib_param"]
     
     if "u" in ds and "v" in ds:
-        u = np.squeeze(ds["u"].values)
-        v = np.squeeze(ds["v"].values)
+        u = _reorient_dataset_array(ds["u"], ds)
+        v = _reorient_dataset_array(ds["v"], ds)
         
         if param_config.get("id") == "pva":
-            lat = ds['latitude'].values
-            lon = ds['longitude'].values
+            lat_name = 'latitude' if 'latitude' in ds.coords else ('lat' if 'lat' in ds.coords else None)
+            lon_name = 'longitude' if 'longitude' in ds.coords else ('lon' if 'lon' in ds.coords else None)
+            lat = ds[lat_name].values if lat_name else np.linspace(90, -90, u.shape[-2])
+            if len(lat) > 1 and lat[0] < lat[-1]:
+                lat = lat[::-1]
+            lon = ds[lon_name].values if lon_name else np.linspace(-180, 180, u.shape[-1], endpoint=False)
+            
             lat_rad = np.deg2rad(lat)
             
             R = 6371000.0
@@ -422,8 +466,7 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
             raw_arr_k = np.hypot(u, v)
     else:
         target_var = grib_var if (isinstance(grib_var, str) and grib_var in ds) else list(ds.data_vars)[0]
-        data_array = ds[target_var]
-        raw_arr_k = np.squeeze(data_array.values)
+        raw_arr_k = _reorient_dataset_array(ds[target_var], ds)
 
     ds.close()
 
@@ -471,13 +514,13 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
 
 def fetch_and_process_step(client, target_date, chosen_run, step, param_config, model_name):
     patterns = param_config["filename_patterns"]
-    grib_file = patterns["grib"].format(model=model_name, param=param_config["id"], step=step)
+    grib_file = os.path.join(TEMP_DIR, patterns["grib"].format(model=model_name, param=param_config["id"], step=step))
     grib_p = param_config["grib_param"]
     
     if step == 0 and param_config.get("grib_param") == "tp":
-        zero_frame = np.zeros((10, 721, 1440), dtype=np.float32)
-        zero_ptype = np.zeros((10, 721, 1440), dtype=np.uint8)
-        zero_packed = [pack_step([]) for _ in range(10)]
+        zero_frame = np.zeros((NUM_MEMBERS, 721, 1440), dtype=np.float32)
+        zero_ptype = np.zeros((NUM_MEMBERS, 721, 1440), dtype=np.uint8)
+        zero_packed = [pack_step([]) for _ in range(NUM_MEMBERS)]
         return step, zero_frame, zero_packed, zero_ptype
 
     retrieve_kwargs = {
@@ -489,7 +532,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
         "param": grib_p if isinstance(grib_p, list) else [grib_p],
         "target": grib_file,
         "stream": "enfo",
-        "number": list(range(1, 11))
+        "number": MEMBER_LIST
     }
 
     if "levelist" in param_config:
@@ -524,58 +567,46 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             ptype_source = param_config.get("ptype_source")
             if ptype_source:
                 if param_config["id"] == "prate":
-                    t2m_file = f"{model_name}_{param_config['id']}_2t_{step:03d}.grib2"
-                    t_pl_file = f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2"
+                    t2m_file = os.path.join(TEMP_DIR, f"{model_name}_{param_config['id']}_2t_{step:03d}.grib2")
+                    t_pl_file = os.path.join(TEMP_DIR, f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2")
                     try:
                         with tm("download_ptype"):
                             client.retrieve(
                                 date=target_date, time=int(chosen_run), step=step, 
                                 stream="enfo", type="pf", levtype="sfc", param=["2t"], 
-                                number=list(range(1, 11)), target=t2m_file
+                                number=MEMBER_LIST, target=t2m_file
                             )
                             client.retrieve(
                                 date=target_date, time=int(chosen_run), step=step, 
                                 stream="enfo", type="pf", levtype="pl", levelist=[850, 700, 500], param=["t"], 
-                                number=list(range(1, 11)), target=t_pl_file
+                                number=MEMBER_LIST, target=t_pl_file
                             )
                         
                         if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
-                            ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-                            if 'number' in ds_2t.coords: ds_2t = ds_2t.sortby('number')
-                            if 'lon' in ds_2t.coords: ds_2t = ds_2t.rename({'lon': 'longitude'})
-                            if 'lat' in ds_2t.coords: ds_2t = ds_2t.rename({'lat': 'latitude'})
-                            ds_2t = ds_2t.sortby('latitude', ascending=False)
-                            if ds_2t.longitude.max() > 180:
-                                ds_2t = ds_2t.assign_coords(longitude=(((ds_2t.longitude + 180) % 360) - 180)).sortby('longitude')
-                                
+                            ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
                             t2m_var = next(iter(ds_2t.data_vars))
-                            t2m_da = ds_2t[t2m_var].squeeze()
+                            t2m_vals = _reorient_dataset_array(ds_2t[t2m_var], ds_2t)
                             
-                            ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-                            if 'number' in ds_t.coords: ds_t = ds_t.sortby('number')
-                            if 'lon' in ds_t.coords: ds_t = ds_t.rename({'lon': 'longitude'})
-                            if 'lat' in ds_t.coords: ds_t = ds_t.rename({'lat': 'latitude'})
-                            ds_t = ds_t.sortby('latitude', ascending=False)
-                            if ds_t.longitude.max() > 180:
-                                ds_t = ds_t.assign_coords(longitude=(((ds_t.longitude + 180) % 360) - 180)).sortby('longitude')
-                                
+                            ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
                             t_var = next(iter(ds_t.data_vars))
-                            t_pl_da = ds_t[t_var].squeeze()
+                            t_pl_da = ds_t[t_var]
                             
                             level_dim = next((dim for dim in t_pl_da.dims if 'isobaric' in dim.lower() or 'level' in dim.lower()), None)
                             if level_dim:
                                 t_pl_da = t_pl_da.where((t_pl_da > 100) & (t_pl_da < 350))
-                                max_col_t = t_pl_da.max(dim=level_dim) 
+                                max_col_t_da = t_pl_da.max(dim=level_dim) 
                             else:
-                                max_col_t = t_pl_da.max(dim=t_pl_da.dims[1])
+                                max_col_t_da = t_pl_da.max(dim=t_pl_da.dims[1])
                                 
-                            ptype_arr = np.zeros_like(t2m_da.values, dtype=np.uint8)
+                            max_col_t = _reorient_dataset_array(max_col_t_da, ds_t)
+                                
+                            ptype_arr = np.zeros_like(t2m_vals, dtype=np.uint8)
                             
-                            rain_mask = t2m_da.values > 273.15
+                            rain_mask = t2m_vals > 273.15
                             ptype_arr[rain_mask] = 1
                             
                             surf_freeze = ~rain_mask
-                            warm_nose = max_col_t.values > 273.15
+                            warm_nose = max_col_t > 273.15
                             
                             ptype_arr[surf_freeze & warm_nose] = 3
                             ptype_arr[surf_freeze & ~warm_nose] = 5
@@ -598,10 +629,13 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             if contour_sources:
                 for c_src in contour_sources:
                     c_id = c_src.get("id", c_src.get("grib_param", "contour"))
-                    c_grib_file = patterns["grib"].format(
-                        model=model_name,
-                        param=f"{param_config['id']}_{c_id}",
-                        step=step
+                    c_grib_file = os.path.join(
+                        TEMP_DIR,
+                        patterns["grib"].format(
+                            model=model_name,
+                            param=f"{param_config['id']}_{c_id}",
+                            step=step
+                        )
                     )
                     c_kwargs = dict(retrieve_kwargs)
                     c_kwargs.update({
@@ -659,8 +693,8 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
 
     frame_h, frame_w = frame_arrays[0].shape[-2:]
     frames_per_volume = 10
-    num_members = 10
-    members_str = "m01-m10"
+    num_members = NUM_MEMBERS
+    members_str = MEMBERS_STR
 
     chunks = []
     patterns = param_config["filename_patterns"]
@@ -727,7 +761,7 @@ def upload_to_huggingface(folder_path, repo_id=HF_REPO_ID):
             folder_path=folder_path,
             repo_id=repo_id,
             repo_type="dataset",
-            commit_message=f"Upload ensemble model grids: {folder_path}"
+            commit_message=f"Upload ensemble model grids ({MEMBERS_STR}): {folder_path}"
         )
         print(f"  ✅ Uploaded to Hugging Face: {folder_path}")
     except Exception as e:
@@ -777,7 +811,7 @@ def run_master_pipeline(selected_param_key="2t"):
     param_config = load_parameter_config(selected_param_key)
     patterns = param_config["filename_patterns"]
 
-    output_dist_dir = f"run_{param_config['id']}"
+    output_dist_dir = f"run_{param_config['id']}_{MEMBERS_STR}"
 
     TIMINGS.clear()
     t_total = time.perf_counter()
@@ -805,8 +839,11 @@ def run_master_pipeline(selected_param_key="2t"):
 
     init_time_iso = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}T{CHOSEN_RUN}:00:00Z"
 
-    print(f"🌍 [{param_config['id']}] Model: {MODEL_NAME} | Param: {param_config['name']} | Run: {CHOSEN_RUN}z on {target_date}")
+    print(f"🌍 [{param_config['id']}] Model: {MODEL_NAME} | Members: {MEMBERS_STR} | Param: {param_config['name']} | Run: {CHOSEN_RUN}z on {target_date}")
 
+    for f in glob.glob(os.path.join(TEMP_DIR, f"{MODEL_NAME}_{param_config['id']}_*.grib2")):
+        try: os.remove(f)
+        except Exception: pass
     for f in glob.glob(f"{MODEL_NAME}_{param_config['id']}_*.grib2"):
         try: os.remove(f)
         except Exception: pass
@@ -878,7 +915,6 @@ def run_master_pipeline(selected_param_key="2t"):
 
     t0 = time.perf_counter()
     if contour_steps and "run_contours" in patterns:
-        # 🌟 Unpack members into binary steps (step*1000 + member) and JSON steps ("step_m{member}")
         flat_binary_steps = {}
         json_steps = {}
 
@@ -914,7 +950,7 @@ def run_master_pipeline(selected_param_key="2t"):
                 }
 
         contour_binary = assemble_contour_file(flat_binary_steps)
-        compressed_contours = gzip.compress(contour_binary, compresslevel=6)
+        compressed_contours = gzip_lib.compress(contour_binary, compresslevel=6)
 
         if len(compressed_contours) >= 100:
             master_contours = {
@@ -922,14 +958,27 @@ def run_master_pipeline(selected_param_key="2t"):
                 "parameter": param_config["id"],
                 "run": f"{CHOSEN_RUN}z",
                 "date": target_date,
-                "members": 10,
+                "members": NUM_MEMBERS,
+                "member_range": MEMBERS_STR,
+                "member_ids": MEMBER_IDS,
                 "type": "ensemble",
                 "steps": json_steps,
             }
 
-            run_contour_filename = patterns["run_contours"].format(
-                model=MODEL_NAME, param=param_config["id"], date=target_date, run=CHOSEN_RUN.lower()
-            )
+            c_pattern = patterns["run_contours"]
+            if "{members}" in c_pattern:
+                run_contour_filename = c_pattern.format(
+                    model=MODEL_NAME, param=param_config["id"], date=target_date, run=CHOSEN_RUN.lower(), members=MEMBERS_STR
+                )
+            elif MEMBERS_STR != "m01-m10":
+                run_contour_filename = c_pattern.replace(".json", f"_{MEMBERS_STR}.json").format(
+                    model=MODEL_NAME, param=param_config["id"], date=target_date, run=CHOSEN_RUN.lower()
+                )
+            else:
+                run_contour_filename = c_pattern.format(
+                    model=MODEL_NAME, param=param_config["id"], date=target_date, run=CHOSEN_RUN.lower()
+                )
+
             run_binary_filename = run_contour_filename.replace(".json", ".bin.gz")
             master_contours["binary"] = {
                 "format": CONTOUR_FORMAT,
@@ -937,7 +986,7 @@ def run_master_pipeline(selected_param_key="2t"):
                 "file": run_binary_filename,
             }
 
-            print(f"  📦 [{param_config['id']}] Contours: {len(contour_binary)/1e6:.2f} MB raw -> {len(compressed_contours)/1e6:.2f} MB gzip")
+            print(f"  📦 [{param_config['id']}] Contours ({MEMBERS_STR}): {len(contour_binary)/1e6:.2f} MB raw -> {len(compressed_contours)/1e6:.2f} MB gzip")
 
             with open(os.path.join(output_dist_dir, run_contour_filename), 'w') as f:
                 json.dump(master_contours, f, separators=(",", ":"))
@@ -945,9 +994,19 @@ def run_master_pipeline(selected_param_key="2t"):
                 f.write(compressed_contours)
 
             if "latest_contours" in patterns:
-                latest_contour_filename = patterns["latest_contours"].format(
-                    model=MODEL_NAME, param=param_config["id"]
-                )
+                lc_pattern = patterns["latest_contours"]
+                if "{members}" in lc_pattern:
+                    latest_contour_filename = lc_pattern.format(
+                        model=MODEL_NAME, param=param_config["id"], members=MEMBERS_STR
+                    )
+                elif MEMBERS_STR != "m01-m10":
+                    latest_contour_filename = lc_pattern.replace(".json", f"_{MEMBERS_STR}.json").format(
+                        model=MODEL_NAME, param=param_config["id"]
+                    )
+                else:
+                    latest_contour_filename = lc_pattern.format(
+                        model=MODEL_NAME, param=param_config["id"]
+                    )
                 with open(os.path.join(output_dist_dir, latest_contour_filename), 'w') as f:
                     json.dump(master_contours, f, separators=(",", ":"))
     phases["contour_file"] = time.perf_counter() - t0
@@ -998,8 +1057,9 @@ def run_master_pipeline(selected_param_key="2t"):
         "date": target_date,
         "init_time": init_time_iso,
         "type": "ensemble_chunked",
-        "members": 10,
-        "member_ids": ["m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08", "m09", "m10"],
+        "members": NUM_MEMBERS,
+        "member_range": MEMBERS_STR,
+        "member_ids": MEMBER_IDS,
         "frames_per_member": 10,
         "member_size_bytes": frame_w * frame_h * 10,
         "total_frames": len(steps_written),
@@ -1012,15 +1072,30 @@ def run_master_pipeline(selected_param_key="2t"):
     }
 
     run_manifest_filename = patterns["run_manifest"].format(
-        model=MODEL_NAME, param=param_config["id"], date=target_date, run=CHOSEN_RUN.lower(), members="m01-m10"
+        model=MODEL_NAME, param=param_config["id"], date=target_date, run=CHOSEN_RUN.lower(), members=MEMBERS_STR
     )
 
-    manifest_files_to_write = ["manifest.json", run_manifest_filename]
+    manifest_files_to_write = [run_manifest_filename]
+
+    if MEMBERS_STR == "m01-m10":
+        manifest_files_to_write.append("manifest.json")
+    else:
+        manifest_files_to_write.append(f"manifest_{MEMBERS_STR}.json")
 
     if "latest_manifest" in patterns:
-        latest_manifest_filename = patterns["latest_manifest"].format(
-            model=MODEL_NAME, param=param_config["id"]
-        )
+        lm_pattern = patterns["latest_manifest"]
+        if "{members}" in lm_pattern:
+            latest_manifest_filename = lm_pattern.format(
+                model=MODEL_NAME, param=param_config["id"], members=MEMBERS_STR
+            )
+        elif MEMBERS_STR != "m01-m10":
+            latest_manifest_filename = lm_pattern.replace(".json", f"_{MEMBERS_STR}.json").format(
+                model=MODEL_NAME, param=param_config["id"]
+            )
+        else:
+            latest_manifest_filename = lm_pattern.format(
+                model=MODEL_NAME, param=param_config["id"]
+            )
         manifest_files_to_write.append(latest_manifest_filename)
 
     for m_fname in manifest_files_to_write:
@@ -1054,7 +1129,7 @@ if __name__ == "__main__":
         else:
             target_params = ["2t"]
 
-    print(f"🚀 Launching Pipeline for Parameters: {target_params}")
+    print(f"🚀 Launching Pipeline for Parameters: {target_params} | Range: {MEMBERS_STR}")
 
     batch_size = MAX_CONCURRENT_PARAMS
     t_run = time.perf_counter()
@@ -1079,7 +1154,10 @@ if __name__ == "__main__":
 
         print(f"⏱️ Batch {batch_num}/{total_batches} took {time.perf_counter() - t_batch:.1f}s", flush=True)
 
-    print("\n🎉 ALL PARAMETERS COMPLETED SUCCESSFULLY!")
-    t_p = time.perf_counter()
-    prune_old_huggingface_runs(days_to_keep=7)
-    print(f"⏱️ prune {time.perf_counter() - t_p:.1f}s | pipeline total {time.perf_counter() - t_run:.1f}s", flush=True)
+    print(f"\n🎉 ALL PARAMETERS COMPLETED FOR {MEMBERS_STR}!")
+    
+    # 🌟 Only let the m01-m10 slice handle pruning to avoid Git commit collision on Hugging Face
+    if MEMBERS_STR == "m01-m10":
+        t_p = time.perf_counter()
+        prune_old_huggingface_runs(days_to_keep=7)
+        print(f"⏱️ prune {time.perf_counter() - t_p:.1f}s | pipeline total {time.perf_counter() - t_run:.1f}s", flush=True)
