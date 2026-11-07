@@ -19,19 +19,14 @@ import rioxarray
 from rasterio.enums import Resampling
 import boto3
 import contourpy
+import gzip
 import struct
 
-# 🌟 Fast Gzip via ISA-L (fallback to standard gzip if not installed)
-try:
-    from isal import igzip as gzip_lib
-except ImportError:
-    import gzip as gzip_lib
+os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
+os.environ.setdefault("TQDM_DISABLE", "1")   # silence download progress bars (best effort)
+sys.stdout.reconfigure(line_buffering=True)  # so log timestamps match reality
 
-# 🌟 RAM disk (/dev/shm) on Linux runners for zero disk I/O latency
-TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK) else "."
-
-# 🌟 DYNAMIC MEMBER RANGE CONFIGURATION
-# Defaults to '1-10', can be overridden via MEMBER_RANGE env var or '--members X-Y' CLI arg
+# 🌟 DYNAMIC MEMBER RANGE CONFIGURATION (Supports GHA Matrix)
 MEMBER_RANGE = os.environ.get("MEMBER_RANGE", "1-10")
 
 for arg in list(sys.argv):
@@ -57,10 +52,6 @@ MEMBER_LIST = parse_member_range(MEMBER_RANGE)
 NUM_MEMBERS = len(MEMBER_LIST)
 MEMBERS_STR = f"m{MEMBER_LIST[0]:02d}-m{MEMBER_LIST[-1]:02d}"
 MEMBER_IDS = [f"m{i:02d}" for i in MEMBER_LIST]
-
-os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
-os.environ.setdefault("TQDM_DISABLE", "1")   # silence download progress bars (best effort)
-sys.stdout.reconfigure(line_buffering=True)  # so log timestamps match reality
 
 # 🌟 MANUAL RUN OVERRIDE (Set to None to automatically fetch the latest run)
 MANUAL_RUN_DATE = 20261107
@@ -114,7 +105,7 @@ def timed(key):
 
 def _gzip_to_file(path, raw_bytes):
     with open(path, "wb") as f:
-        f.write(gzip_lib.compress(raw_bytes, compresslevel=GZIP_LEVEL))
+        f.write(gzip.compress(raw_bytes, compresslevel=GZIP_LEVEL))
 
 def _print_timing(pid, phases, total):
     ph = " | ".join(f"{k} {v:.1f}s" for k, v in phases.items())
@@ -129,34 +120,6 @@ def load_parameter_config(param_key="2t"):
             if param_key in params:
                 return params[param_key]
     raise FileNotFoundError(f"Parameter '{param_key}' not found in {CONFIG_FILE_PATH}")
-
-# ---------------------------------------------------------------------------
-# Fast NumPy Grid Reorientation (Bypasses slow xarray sortby / assign_coords)
-# ---------------------------------------------------------------------------
-def _reorient_dataset_array(da, ds):
-    arr = np.squeeze(da.values)
-    
-    # 1. Sort ensemble members if present
-    if 'number' in ds.coords:
-        nums = ds['number'].values
-        if len(nums) > 1 and not np.all(np.diff(nums) >= 0):
-            arr = arr[np.argsort(nums)]
-            
-    # 2. Ensure latitude is descending (90 -> -90)
-    lat_name = 'latitude' if 'latitude' in ds.coords else ('lat' if 'lat' in ds.coords else None)
-    if lat_name is not None:
-        lats = ds[lat_name].values
-        if len(lats) > 1 and lats[0] < lats[-1]:
-            arr = np.flip(arr, axis=-2)
-            
-    # 3. Ensure longitude is [-180, 180) via fast NumPy roll
-    lon_name = 'longitude' if 'longitude' in ds.coords else ('lon' if 'lon' in ds.coords else None)
-    if lon_name is not None:
-        lons = ds[lon_name].values
-        if len(lons) > 1 and np.nanmax(lons) > 180:
-            arr = np.roll(arr, arr.shape[-1] // 2, axis=-1)
-            
-    return arr
 
 # ---------------------------------------------------------------------------
 # Contours: vectorized extraction + CTV2 binary packing
@@ -397,7 +360,18 @@ def get_climatology_grid(param_id, target_date=None, target_shape=(721, 1440), u
 
 @timed("decode_all")
 def process_thickness_grib(grib_path, contour_config):
-    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+
+    if 'number' in ds.coords: ds = ds.sortby('number')
+
+    if 'lon' in ds.coords:
+        ds = ds.rename({'lon': 'longitude'})
+    if 'lat' in ds.coords:
+        ds = ds.rename({'lat': 'latitude'})
+
+    ds = ds.sortby('latitude', ascending=False)
+    if ds.longitude.max() > 180:
+        ds = ds.assign_coords(longitude=(((ds.longitude + 180) % 360) - 180)).sortby('longitude')
 
     target_var = "z" if "z" in ds else list(ds.data_vars)[0]
     da = ds[target_var]
@@ -405,11 +379,11 @@ def process_thickness_grib(grib_path, contour_config):
     level_coord = next((c for c in da.coords if 'isobaric' in c.lower() or 'level' in c.lower()), None)
 
     if level_coord:
-        z500 = _reorient_dataset_array(da.sel({level_coord: 500}), ds)
-        z1000 = _reorient_dataset_array(da.sel({level_coord: 1000}), ds)
+        z500 = da.sel({level_coord: 500}).values.squeeze()
+        z1000 = da.sel({level_coord: 1000}).values.squeeze()
     else:
-        z500 = _reorient_dataset_array(da[0], ds)
-        z1000 = _reorient_dataset_array(da[1], ds)
+        raw_vals = da.values
+        z500, z1000 = raw_vals[0].squeeze(), raw_vals[1].squeeze()
 
     ds.close()
 
@@ -434,22 +408,31 @@ def process_thickness_grib(grib_path, contour_config):
 
 @timed("decode_all")
 def process_grib_to_array(grib_path, param_config, want_raster=True, target_date=None, want_raw=False):
-    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+
+    if 'number' in ds.coords: ds = ds.sortby('number')
+
+    if 'lon' in ds.coords:
+        ds = ds.rename({'lon': 'longitude'})
+    if 'lat' in ds.coords:
+        ds = ds.rename({'lat': 'latitude'})
+
+    ds = ds.sortby('latitude', ascending=False)
+
+    if ds.longitude.max() > 180:
+        ds = ds.assign_coords(
+            longitude=(((ds.longitude + 180) % 360) - 180)
+        ).sortby('longitude')
 
     grib_var = param_config["grib_param"]
     
     if "u" in ds and "v" in ds:
-        u = _reorient_dataset_array(ds["u"], ds)
-        v = _reorient_dataset_array(ds["v"], ds)
+        u = np.squeeze(ds["u"].values)
+        v = np.squeeze(ds["v"].values)
         
         if param_config.get("id") == "pva":
-            lat_name = 'latitude' if 'latitude' in ds.coords else ('lat' if 'lat' in ds.coords else None)
-            lon_name = 'longitude' if 'longitude' in ds.coords else ('lon' if 'lon' in ds.coords else None)
-            lat = ds[lat_name].values if lat_name else np.linspace(90, -90, u.shape[-2])
-            if len(lat) > 1 and lat[0] < lat[-1]:
-                lat = lat[::-1]
-            lon = ds[lon_name].values if lon_name else np.linspace(-180, 180, u.shape[-1], endpoint=False)
-            
+            lat = ds['latitude'].values
+            lon = ds['longitude'].values
             lat_rad = np.deg2rad(lat)
             
             R = 6371000.0
@@ -466,7 +449,8 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
             raw_arr_k = np.hypot(u, v)
     else:
         target_var = grib_var if (isinstance(grib_var, str) and grib_var in ds) else list(ds.data_vars)[0]
-        raw_arr_k = _reorient_dataset_array(ds[target_var], ds)
+        data_array = ds[target_var]
+        raw_arr_k = np.squeeze(data_array.values)
 
     ds.close()
 
@@ -514,7 +498,7 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
 
 def fetch_and_process_step(client, target_date, chosen_run, step, param_config, model_name):
     patterns = param_config["filename_patterns"]
-    grib_file = os.path.join(TEMP_DIR, patterns["grib"].format(model=model_name, param=param_config["id"], step=step))
+    grib_file = patterns["grib"].format(model=model_name, param=param_config["id"], step=step)
     grib_p = param_config["grib_param"]
     
     if step == 0 and param_config.get("grib_param") == "tp":
@@ -567,8 +551,8 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             ptype_source = param_config.get("ptype_source")
             if ptype_source:
                 if param_config["id"] == "prate":
-                    t2m_file = os.path.join(TEMP_DIR, f"{model_name}_{param_config['id']}_2t_{step:03d}.grib2")
-                    t_pl_file = os.path.join(TEMP_DIR, f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2")
+                    t2m_file = f"{model_name}_{param_config['id']}_2t_{step:03d}.grib2"
+                    t_pl_file = f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2"
                     try:
                         with tm("download_ptype"):
                             client.retrieve(
@@ -583,30 +567,42 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             )
                         
                         if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
-                            ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
+                            ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            if 'number' in ds_2t.coords: ds_2t = ds_2t.sortby('number')
+                            if 'lon' in ds_2t.coords: ds_2t = ds_2t.rename({'lon': 'longitude'})
+                            if 'lat' in ds_2t.coords: ds_2t = ds_2t.rename({'lat': 'latitude'})
+                            ds_2t = ds_2t.sortby('latitude', ascending=False)
+                            if ds_2t.longitude.max() > 180:
+                                ds_2t = ds_2t.assign_coords(longitude=(((ds_2t.longitude + 180) % 360) - 180)).sortby('longitude')
+                                
                             t2m_var = next(iter(ds_2t.data_vars))
-                            t2m_vals = _reorient_dataset_array(ds_2t[t2m_var], ds_2t)
+                            t2m_da = ds_2t[t2m_var].squeeze()
                             
-                            ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore', 'indexpath': ''})
+                            ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
+                            if 'number' in ds_t.coords: ds_t = ds_t.sortby('number')
+                            if 'lon' in ds_t.coords: ds_t = ds_t.rename({'lon': 'longitude'})
+                            if 'lat' in ds_t.coords: ds_t = ds_t.rename({'lat': 'latitude'})
+                            ds_t = ds_t.sortby('latitude', ascending=False)
+                            if ds_t.longitude.max() > 180:
+                                ds_t = ds_t.assign_coords(longitude=(((ds_t.longitude + 180) % 360) - 180)).sortby('longitude')
+                                
                             t_var = next(iter(ds_t.data_vars))
-                            t_pl_da = ds_t[t_var]
+                            t_pl_da = ds_t[t_var].squeeze()
                             
                             level_dim = next((dim for dim in t_pl_da.dims if 'isobaric' in dim.lower() or 'level' in dim.lower()), None)
                             if level_dim:
                                 t_pl_da = t_pl_da.where((t_pl_da > 100) & (t_pl_da < 350))
-                                max_col_t_da = t_pl_da.max(dim=level_dim) 
+                                max_col_t = t_pl_da.max(dim=level_dim) 
                             else:
-                                max_col_t_da = t_pl_da.max(dim=t_pl_da.dims[1])
+                                max_col_t = t_pl_da.max(dim=t_pl_da.dims[1])
                                 
-                            max_col_t = _reorient_dataset_array(max_col_t_da, ds_t)
-                                
-                            ptype_arr = np.zeros_like(t2m_vals, dtype=np.uint8)
+                            ptype_arr = np.zeros_like(t2m_da.values, dtype=np.uint8)
                             
-                            rain_mask = t2m_vals > 273.15
+                            rain_mask = t2m_da.values > 273.15
                             ptype_arr[rain_mask] = 1
                             
                             surf_freeze = ~rain_mask
-                            warm_nose = max_col_t > 273.15
+                            warm_nose = max_col_t.values > 273.15
                             
                             ptype_arr[surf_freeze & warm_nose] = 3
                             ptype_arr[surf_freeze & ~warm_nose] = 5
@@ -629,13 +625,10 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
             if contour_sources:
                 for c_src in contour_sources:
                     c_id = c_src.get("id", c_src.get("grib_param", "contour"))
-                    c_grib_file = os.path.join(
-                        TEMP_DIR,
-                        patterns["grib"].format(
-                            model=model_name,
-                            param=f"{param_config['id']}_{c_id}",
-                            step=step
-                        )
+                    c_grib_file = patterns["grib"].format(
+                        model=model_name,
+                        param=f"{param_config['id']}_{c_id}",
+                        step=step
                     )
                     c_kwargs = dict(retrieve_kwargs)
                     c_kwargs.update({
@@ -841,9 +834,6 @@ def run_master_pipeline(selected_param_key="2t"):
 
     print(f"🌍 [{param_config['id']}] Model: {MODEL_NAME} | Members: {MEMBERS_STR} | Param: {param_config['name']} | Run: {CHOSEN_RUN}z on {target_date}")
 
-    for f in glob.glob(os.path.join(TEMP_DIR, f"{MODEL_NAME}_{param_config['id']}_*.grib2")):
-        try: os.remove(f)
-        except Exception: pass
     for f in glob.glob(f"{MODEL_NAME}_{param_config['id']}_*.grib2"):
         try: os.remove(f)
         except Exception: pass
@@ -950,7 +940,7 @@ def run_master_pipeline(selected_param_key="2t"):
                 }
 
         contour_binary = assemble_contour_file(flat_binary_steps)
-        compressed_contours = gzip_lib.compress(contour_binary, compresslevel=6)
+        compressed_contours = gzip.compress(contour_binary, compresslevel=6)
 
         if len(compressed_contours) >= 100:
             master_contours = {
@@ -1156,7 +1146,7 @@ if __name__ == "__main__":
 
     print(f"\n🎉 ALL PARAMETERS COMPLETED FOR {MEMBERS_STR}!")
     
-    # 🌟 Only let the m01-m10 slice handle pruning to avoid Git commit collision on Hugging Face
+    # 🌟 Only let the m01-m10 runner prune expired runs so matrix jobs don't collide
     if MEMBERS_STR == "m01-m10":
         t_p = time.perf_counter()
         prune_old_huggingface_runs(days_to_keep=7)
