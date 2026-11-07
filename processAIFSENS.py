@@ -598,7 +598,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                                 
                             ptype_arr = np.zeros_like(t2m_da.values, dtype=np.uint8)
                             
-                            rain_mask = t2m_da.values > 273.15
+                            rain_mask = t2m_da.values > 274.817
                             ptype_arr[rain_mask] = 1
                             
                             surf_freeze = ~rain_mask
