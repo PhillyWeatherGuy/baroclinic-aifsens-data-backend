@@ -27,8 +27,8 @@ os.environ.setdefault("TQDM_DISABLE", "1")   # silence download progress bars (b
 sys.stdout.reconfigure(line_buffering=True)  # so log timestamps match reality
 
 # 🌟 MANUAL RUN OVERRIDE (Set to None to automatically fetch the latest run)
-MANUAL_RUN_DATE = None
-MANUAL_RUN_CYCLE = None
+MANUAL_RUN_DATE = 20261106
+MANUAL_RUN_CYCLE = 18
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
 FORECAST_STEPS = list(range(0, 361, 6))
