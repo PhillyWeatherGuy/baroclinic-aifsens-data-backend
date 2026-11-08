@@ -54,8 +54,8 @@ MEMBERS_STR = f"m{MEMBER_LIST[0]:02d}-m{MEMBER_LIST[-1]:02d}"
 MEMBER_IDS = [f"m{i:02d}" for i in MEMBER_LIST]
 
 # 🌟 MANUAL RUN OVERRIDE (Set to None to automatically fetch the latest run)
-MANUAL_RUN_DATE = 20261107
-MANUAL_RUN_CYCLE = 12
+MANUAL_RUN_DATE = 20261108
+MANUAL_RUN_CYCLE = 06
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
 FORECAST_STEPS = list(range(0, 361, 6))
