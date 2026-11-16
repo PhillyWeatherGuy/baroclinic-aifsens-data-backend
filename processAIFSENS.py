@@ -26,6 +26,14 @@ os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
 os.environ.setdefault("TQDM_DISABLE", "1")   # silence download progress bars (best effort)
 sys.stdout.reconfigure(line_buffering=True)  # so log timestamps match reality
 
+# 🌟 NORTH AMERICA BOUNDING BOX (0.25° grid crop)
+NA_LAT_MIN = 5.0
+NA_LAT_MAX = 80.0
+NA_LON_MIN = -175.0
+NA_LON_MAX = -40.0
+NA_GRID_H = int(round((NA_LAT_MAX - NA_LAT_MIN) / 0.25)) + 1
+NA_GRID_W = int(round((NA_LON_MAX - NA_LON_MIN) / 0.25)) + 1
+
 # 🌟 DYNAMIC MEMBER RANGE CONFIGURATION (Supports GHA Matrix)
 MEMBER_RANGE = os.environ.get("MEMBER_RANGE", "1-10")
 
@@ -226,13 +234,11 @@ def extract_contour_levels(raw_arr_k, contours_config=None, contour_settings=Non
         frame_h, frame_w = working_arr.shape
         smoothed = cv2.GaussianBlur(working_arr, blur_kernel, blur_sigma)
         smoothed_flipped = np.flipud(smoothed)
-        smoothed_cyclic = np.hstack([smoothed_flipped, smoothed_flipped[:, :1]])
 
-        lon_step = 360.0 / frame_w
-        lons = np.linspace(-180.0, 180.0 + lon_step, frame_w + 1)
-        lats = np.linspace(-90.0, 90.0, frame_h)
+        lons = np.linspace(NA_LON_MIN, NA_LON_MAX, frame_w)
+        lats = np.linspace(NA_LAT_MIN, NA_LAT_MAX, frame_h)
         cont_gen = contourpy.contour_generator(
-            x=lons, y=lats, z=smoothed_cyclic,
+            x=lons, y=lats, z=smoothed_flipped,
             line_type=contourpy.LineType.ChunkCombinedOffset,
         )
 
@@ -307,9 +313,9 @@ def normalize_array(raw_arr, param_config):
         arr *= 255.0
         return arr.astype(np.uint8)
 
-def get_climatology_grid(param_id, target_date=None, target_shape=(721, 1440), unit="m"):
+def get_climatology_grid(param_id, target_date=None, target_shape=(NA_GRID_H, NA_GRID_W), unit="m"):
     month = int(target_date[4:6]) if target_date and len(target_date) >= 6 else 10
-    cache_key = f"{param_id}_{month}_{unit}"
+    cache_key = f"{param_id}_{month}_{unit}_{target_shape[0]}x{target_shape[1]}"
     if cache_key in CLIMATOLOGY_CACHE:
         return CLIMATOLOGY_CACHE[cache_key]
 
@@ -342,6 +348,13 @@ def get_climatology_grid(param_id, target_date=None, target_shape=(721, 1440), u
                 elif c_path.endswith(".npy"):
                     grid = np.load(c_path).astype(np.float32)
 
+                if grid.shape == (721, 1440) and target_shape != (721, 1440):
+                    y0 = int(round((90.0 - NA_LAT_MAX) / 0.25))
+                    y1 = int(round((90.0 - NA_LAT_MIN) / 0.25)) + 1
+                    x0 = int(round((NA_LON_MIN + 180.0) / 0.25))
+                    x1 = int(round((NA_LON_MAX + 180.0) / 0.25)) + 1
+                    grid = grid[y0:y1, x0:x1]
+
                 if grid.shape != target_shape:
                     grid = cv2.resize(grid, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_LINEAR)
 
@@ -372,6 +385,9 @@ def process_thickness_grib(grib_path, contour_config):
     ds = ds.sortby('latitude', ascending=False)
     if ds.longitude.max() > 180:
         ds = ds.assign_coords(longitude=(((ds.longitude + 180) % 360) - 180)).sortby('longitude')
+
+    # 🌟 Crop to North America bounding box
+    ds = ds.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
 
     target_var = "z" if "z" in ds else list(ds.data_vars)[0]
     da = ds[target_var]
@@ -423,6 +439,9 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
         ds = ds.assign_coords(
             longitude=(((ds.longitude + 180) % 360) - 180)
         ).sortby('longitude')
+
+    # 🌟 Crop to North America bounding box
+    ds = ds.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
 
     grib_var = param_config["grib_param"]
     
@@ -502,8 +521,8 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
     grib_p = param_config["grib_param"]
     
     if step == 0 and param_config.get("grib_param") == "tp":
-        zero_frame = np.zeros((NUM_MEMBERS, 721, 1440), dtype=np.float32)
-        zero_ptype = np.zeros((NUM_MEMBERS, 721, 1440), dtype=np.uint8)
+        zero_frame = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.float32)
+        zero_ptype = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.uint8)
         zero_packed = [pack_step([]) for _ in range(NUM_MEMBERS)]
         return step, zero_frame, zero_packed, zero_ptype
 
@@ -574,6 +593,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             ds_2t = ds_2t.sortby('latitude', ascending=False)
                             if ds_2t.longitude.max() > 180:
                                 ds_2t = ds_2t.assign_coords(longitude=(((ds_2t.longitude + 180) % 360) - 180)).sortby('longitude')
+                            ds_2t = ds_2t.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
                                 
                             t2m_var = next(iter(ds_2t.data_vars))
                             t2m_da = ds_2t[t2m_var].squeeze()
@@ -585,6 +605,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
                             ds_t = ds_t.sortby('latitude', ascending=False)
                             if ds_t.longitude.max() > 180:
                                 ds_t = ds_t.assign_coords(longitude=(((ds_t.longitude + 180) % 360) - 180)).sortby('longitude')
+                            ds_t = ds_t.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
                                 
                             t_var = next(iter(ds_t.data_vars))
                             t_pl_da = ds_t[t_var].squeeze()
@@ -1055,6 +1076,12 @@ def run_master_pipeline(selected_param_key="2t"):
         "total_frames": len(steps_written),
         "frame_width": frame_w,
         "frame_height": frame_h,
+        "bounds": {
+            "west": NA_LON_MIN,
+            "east": NA_LON_MAX,
+            "south": NA_LAT_MIN,
+            "north": NA_LAT_MAX
+        },
         "temp_min_k": param_config.get("min_val", param_config.get("scaling", {}).get("min_val", 0.0)),
         "temp_max_k": param_config.get("max_val", param_config.get("scaling", {}).get("max_val", 255.0)),
         "chunks": manifest_chunks,
