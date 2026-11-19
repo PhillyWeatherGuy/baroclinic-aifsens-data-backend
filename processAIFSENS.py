@@ -7,12 +7,14 @@ import math
 import sys
 import re
 import time
+import tempfile
 import threading
 import contextlib
 import functools
 import concurrent.futures
 import numpy as np
 import xarray as xr
+import eccodes
 import cv2
 from ecmwf.opendata import Client
 import rioxarray
@@ -62,8 +64,8 @@ MEMBERS_STR = f"m{MEMBER_LIST[0]:02d}-m{MEMBER_LIST[-1]:02d}"
 MEMBER_IDS = [f"m{i:02d}" for i in MEMBER_LIST]
 
 # 🌟 MANUAL RUN OVERRIDE (Set to None to automatically fetch the latest run)
-MANUAL_RUN_DATE = 20261118
-MANUAL_RUN_CYCLE = 18
+MANUAL_RUN_DATE = 20261119
+MANUAL_RUN_CYCLE = 0
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
 FORECAST_STEPS = list(range(0, 361, 6))
@@ -83,6 +85,10 @@ CONTOUR_FORMAT = "CTV2"
 INT16_MAX = 32767
 
 CLIMATOLOGY_CACHE = {}
+_ECCODES_LOCK = threading.Lock()
+_NA_CROP_CACHE = {}
+_MEMBER_TO_IDX = {m: idx for idx, m in enumerate(sorted(MEMBER_LIST))}
+SHARED_2T_CACHE_DIR = os.path.join(tempfile.gettempdir(), f"aifs_2t_cache_{MEMBERS_STR}")
 
 # ---------------------------------------------------------------------------
 # Timing instrumentation
@@ -128,6 +134,106 @@ def load_parameter_config(param_key="2t"):
             if param_key in params:
                 return params[param_key]
     raise FileNotFoundError(f"Parameter '{param_key}' not found in {CONFIG_FILE_PATH}")
+
+# ---------------------------------------------------------------------------
+# Fast direct ecCodes GRIB2 decoder + North America crop
+# ---------------------------------------------------------------------------
+
+def _to_slice_or_idx(idx):
+    if len(idx) >= 2:
+        diffs = np.diff(idx)
+        if np.all(diffs == 1):
+            return slice(int(idx[0]), int(idx[-1]) + 1)
+        if np.all(diffs == -1):
+            stop = None if idx[-1] == 0 else int(idx[-1]) - 1
+            return slice(int(idx[0]), stop, -1)
+    return idx
+
+def _get_na_crop(ni, nj, lat_first, lat_last, lon_first, lon_last):
+    key = (ni, nj, round(lat_first, 6), round(lat_last, 6), round(lon_first, 6), round(lon_last, 6))
+    cached = _NA_CROP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    lats = np.linspace(lat_first, lat_last, nj)
+    lat_idx = np.flatnonzero((lats >= NA_LAT_MIN - 1e-6) & (lats <= NA_LAT_MAX + 1e-6))
+    if len(lat_idx) > 1 and lats[lat_idx[0]] < lats[lat_idx[-1]]:
+        lat_idx = lat_idx[::-1]
+
+    lons = np.linspace(lon_first, lon_last, ni)
+    lons_180 = ((lons + 180.0) % 360.0) - 180.0
+    lon_idx = np.flatnonzero((lons_180 >= NA_LON_MIN - 1e-6) & (lons_180 <= NA_LON_MAX + 1e-6))
+    lon_idx = lon_idx[np.argsort(lons_180[lon_idx], kind="stable")]
+
+    lats_na = lats[lat_idx]
+    lons_na = lons_180[lon_idx]
+    lat_sel = _to_slice_or_idx(lat_idx)
+    lon_sel = _to_slice_or_idx(lon_idx)
+    use_slices = isinstance(lat_sel, slice) and isinstance(lon_sel, slice)
+    ix = None if use_slices else np.ix_(lat_idx, lon_idx)
+
+    entry = (lat_sel, lon_sel, ix, lats_na, lons_na, len(lat_idx), len(lon_idx))
+    _NA_CROP_CACHE[key] = entry
+    return entry
+
+def read_grib_na(grib_path):
+    by_param = {}
+    lats_na = None
+    lons_na = None
+
+    with _ECCODES_LOCK:
+        with open(grib_path, "rb") as f:
+            while True:
+                gid = eccodes.codes_grib_new_from_file(f)
+                if gid is None:
+                    break
+                try:
+                    short_name = eccodes.codes_get(gid, "shortName")
+                    level = int(eccodes.codes_get(gid, "level"))
+                    try:
+                        m_num = int(eccodes.codes_get(gid, "perturbationNumber"))
+                    except Exception:
+                        m_num = 0
+
+                    m_idx = _MEMBER_TO_IDX.get(m_num)
+                    if m_idx is None:
+                        if NUM_MEMBERS == 1:
+                            m_idx = 0
+                        else:
+                            continue
+
+                    ni = int(eccodes.codes_get(gid, "Ni"))
+                    nj = int(eccodes.codes_get(gid, "Nj"))
+                    lat_first = float(eccodes.codes_get(gid, "latitudeOfFirstGridPointInDegrees"))
+                    lat_last = float(eccodes.codes_get(gid, "latitudeOfLastGridPointInDegrees"))
+                    lon_first = float(eccodes.codes_get(gid, "longitudeOfFirstGridPointInDegrees"))
+                    lon_last = float(eccodes.codes_get(gid, "longitudeOfLastGridPointInDegrees"))
+
+                    lat_sel, lon_sel, ix, lats_na, lons_na, h_na, w_na = _get_na_crop(
+                        ni, nj, lat_first, lat_last, lon_first, lon_last
+                    )
+
+                    vals = eccodes.codes_get_values(gid).reshape(nj, ni)
+                    cropped = vals[lat_sel, lon_sel] if ix is None else vals[ix]
+                    cropped = cropped.astype(np.float32, copy=True)
+
+                    if eccodes.codes_get(gid, "bitmapPresent"):
+                        miss = float(eccodes.codes_get(gid, "missingValue"))
+                        cropped[cropped == miss] = np.nan
+
+                    lvl_dict = by_param.setdefault(short_name, {})
+                    arr = lvl_dict.get(level)
+                    if arr is None:
+                        arr = np.full((NUM_MEMBERS, h_na, w_na), np.nan, dtype=np.float32)
+                        lvl_dict[level] = arr
+                    arr[m_idx] = cropped
+                finally:
+                    eccodes.codes_release(gid)
+
+    return by_param, lats_na, lons_na
+
+def _get_2t_cache_path(target_date, chosen_run, step):
+    return os.path.join(SHARED_2T_CACHE_DIR, f"2t_{target_date}_{chosen_run}_{step:03d}.npy")
 
 # ---------------------------------------------------------------------------
 # Contours: vectorized extraction + CTV2 binary packing
@@ -373,39 +479,17 @@ def get_climatology_grid(param_id, target_date=None, target_shape=(NA_GRID_H, NA
 
 @timed("decode_all")
 def process_thickness_grib(grib_path, contour_config):
-    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-
-    if 'number' in ds.coords: ds = ds.sortby('number')
-
-    if 'lon' in ds.coords:
-        ds = ds.rename({'lon': 'longitude'})
-    if 'lat' in ds.coords:
-        ds = ds.rename({'lat': 'latitude'})
-
-    ds = ds.sortby('latitude', ascending=False)
-    if ds.longitude.max() > 180:
-        ds = ds.assign_coords(longitude=(((ds.longitude + 180) % 360) - 180)).sortby('longitude')
-
-    # 🌟 Crop to North America bounding box
-    ds = ds.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
-
-    target_var = "z" if "z" in ds else list(ds.data_vars)[0]
-    da = ds[target_var]
-
-    level_coord = next((c for c in da.coords if 'isobaric' in c.lower() or 'level' in c.lower()), None)
-
-    if level_coord:
-        z500 = da.sel({level_coord: 500}).values.squeeze()
-        z1000 = da.sel({level_coord: 1000}).values.squeeze()
+    by_param, _, _ = read_grib_na(grib_path)
+    z_levels = by_param.get("z") or by_param[next(iter(by_param))]
+    if 500 in z_levels and 1000 in z_levels:
+        z500 = z_levels[500]
+        z1000 = z_levels[1000]
     else:
-        raw_vals = da.values
-        z500, z1000 = raw_vals[0].squeeze(), raw_vals[1].squeeze()
+        sorted_lvls = sorted(z_levels)
+        z500, z1000 = z_levels[sorted_lvls[0]], z_levels[sorted_lvls[1]]
 
-    ds.close()
-
-    # 🌟 Extract thickness per member without collapsing to ensemble mean
-    if z500.ndim == 3:
-        thickness_dam = (z500 - z1000) / 98.0665
+    thickness_dam = (z500 - z1000) / 98.0665
+    if thickness_dam.ndim == 3:
         return [
             extract_contour_levels(
                 thickness_dam[m],
@@ -415,7 +499,6 @@ def process_thickness_grib(grib_path, contour_config):
             for m in range(thickness_dam.shape[0])
         ]
 
-    thickness_dam = (z500 - z1000) / 98.0665
     return [extract_contour_levels(
         thickness_dam,
         contour_config.get("contours", []),
@@ -423,55 +506,37 @@ def process_thickness_grib(grib_path, contour_config):
     )]
 
 @timed("decode_all")
-def process_grib_to_array(grib_path, param_config, want_raster=True, target_date=None, want_raw=False):
-    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-
-    if 'number' in ds.coords: ds = ds.sortby('number')
-
-    if 'lon' in ds.coords:
-        ds = ds.rename({'lon': 'longitude'})
-    if 'lat' in ds.coords:
-        ds = ds.rename({'lat': 'latitude'})
-
-    ds = ds.sortby('latitude', ascending=False)
-
-    if ds.longitude.max() > 180:
-        ds = ds.assign_coords(
-            longitude=(((ds.longitude + 180) % 360) - 180)
-        ).sortby('longitude')
-
-    # 🌟 Crop to North America bounding box
-    ds = ds.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
+def process_grib_to_array(grib_path, param_config, want_raster=True, target_date=None, want_raw=False, preloaded=None):
+    if preloaded is not None:
+        by_param, lats_na, lons_na = preloaded
+    else:
+        by_param, lats_na, lons_na = read_grib_na(grib_path)
 
     grib_var = param_config["grib_param"]
-    
-    if "u" in ds and "v" in ds:
-        u = np.squeeze(ds["u"].values)
-        v = np.squeeze(ds["v"].values)
-        
+
+    if "u" in by_param and "v" in by_param:
+        u = np.squeeze(next(iter(by_param["u"].values())))
+        v = np.squeeze(next(iter(by_param["v"].values())))
+
         if param_config.get("id") == "pva":
-            lat = ds['latitude'].values
-            lon = ds['longitude'].values
-            lat_rad = np.deg2rad(lat)
-            
+            lat_rad = np.deg2rad(lats_na)
             R = 6371000.0
-            dlat = np.deg2rad(np.abs(lat[0] - lat[1]))
-            dlon = np.deg2rad(np.abs(lon[1] - lon[0]))
-            
+            dlat = np.deg2rad(np.abs(lats_na[0] - lats_na[1]))
+            dlon = np.deg2rad(np.abs(lons_na[1] - lons_na[0]))
+
             dy = R * dlat
             dx = R * np.cos(lat_rad[:, None]) * dlon
-            
+
             dv_dx = np.gradient(v, axis=-1) / dx[-1]
             du_dy = -np.gradient(u, axis=-2) / dy
             raw_arr_k = dv_dx - du_dy
         else:
             raw_arr_k = np.hypot(u, v)
     else:
-        target_var = grib_var if (isinstance(grib_var, str) and grib_var in ds) else list(ds.data_vars)[0]
-        data_array = ds[target_var]
-        raw_arr_k = np.squeeze(data_array.values)
-
-    ds.close()
+        target_var = grib_var if (isinstance(grib_var, str) and grib_var in by_param) else next(iter(by_param))
+        raw_arr_k = next(iter(by_param[target_var].values()))
+        if NUM_MEMBERS == 1 and raw_arr_k.shape[0] == 1:
+            raw_arr_k = raw_arr_k[0]
 
     if param_config.get("category_mode"):
         return np.nan_to_num(raw_arr_k, nan=0.0).clip(0, 255).astype(np.uint8), []
@@ -526,13 +591,63 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
         zero_packed = [pack_step([]) for _ in range(NUM_MEMBERS)]
         return step, zero_frame, zero_packed, zero_ptype
 
+    contour_sources = param_config.get("contour_sources")
+    if not contour_sources and param_config.get("contour_source"):
+        contour_sources = [param_config["contour_source"]]
+
+    has_contours = bool(contour_sources)
+    raster_config = {**param_config, "contours": []} if has_contours else param_config
+    is_interval = bool(param_config.get("interval_hours") or re.search(r'[-_]?(6|24)h(?:r)?$', param_config.get("id", "").lower()))
+
+    # 🌟 Reuse cached 2t grid written by prate when available
+    if param_config["id"] == "2t" and not contour_sources:
+        cache_2t = _get_2t_cache_path(target_date, chosen_run, step)
+        if os.path.exists(cache_2t):
+            try:
+                t2m_cached = np.load(cache_2t)
+                preloaded = ({"2t": {2: t2m_cached}}, None, None)
+                frame_arr, raw_contour_levels = process_grib_to_array(
+                    None, raster_config, target_date=target_date, want_raw=is_interval, preloaded=preloaded
+                )
+                if raw_contour_levels and not isinstance(raw_contour_levels[0], list):
+                    contour_levels = [list(raw_contour_levels)]
+                else:
+                    contour_levels = [list(m_l) for m_l in raw_contour_levels]
+                packed = [pack_step(m_lev) for m_lev in contour_levels]
+                print(f"  ⚡ [{param_config['id']}] Processed F{step:03d} (cached 2t)")
+                return step, frame_arr, packed, None
+            except Exception:
+                pass
+
+    base_params = list(grib_p) if isinstance(grib_p, list) else [grib_p]
+    levtype = param_config.get("levtype", "sfc")
+    ptype_source = param_config.get("ptype_source")
+    need_prate_ptype = bool(ptype_source and param_config["id"] == "prate")
+
+    batched_sfc_sources = []
+    remaining_contour_sources = []
+    if contour_sources:
+        for c_src in contour_sources:
+            if levtype == "sfc" and c_src.get("levtype", "sfc") == "sfc" and "levelist" not in c_src and c_src.get("type") != "thickness":
+                batched_sfc_sources.append(c_src)
+            else:
+                remaining_contour_sources.append(c_src)
+
+    retrieve_params = list(base_params)
+    if levtype == "sfc":
+        if need_prate_ptype:
+            retrieve_params.append("2t")
+        for c_src in batched_sfc_sources:
+            retrieve_params.append(c_src["grib_param"])
+    retrieve_params = list(dict.fromkeys(retrieve_params))
+
     retrieve_kwargs = {
         "date": target_date,
         "time": int(chosen_run),
         "step": step,
         "type": "pf",
-        "levtype": param_config.get("levtype", "sfc"),
-        "param": grib_p if isinstance(grib_p, list) else [grib_p],
+        "levtype": levtype,
+        "param": retrieve_params,
         "target": grib_file,
         "stream": "enfo",
         "number": MEMBER_LIST
@@ -545,106 +660,85 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
         with tm("download"):
             client.retrieve(**retrieve_kwargs)
         if os.path.exists(grib_file):
-            contour_sources = param_config.get("contour_sources")
-            if not contour_sources and param_config.get("contour_source"):
-                contour_sources = [param_config["contour_source"]]
+            with tm("decode_all"):
+                by_param, lats_na, lons_na = read_grib_na(grib_file)
 
-            has_contours = bool(contour_sources)
-            raster_config = {**param_config, "contours": []} if has_contours else param_config
-            is_interval = bool(param_config.get("interval_hours") or re.search(r'[-_]?(6|24)h(?:r)?$', param_config.get("id", "").lower()))
-            
-            frame_arr, raw_contour_levels = process_grib_to_array(grib_file, raster_config, target_date=target_date, want_raw=is_interval)
-            
+            try: os.remove(grib_file)
+            except Exception: pass
+
+            preloaded = (by_param, lats_na, lons_na)
+            frame_arr, raw_contour_levels = process_grib_to_array(
+                None, raster_config, target_date=target_date, want_raw=is_interval, preloaded=preloaded
+            )
+
             # Ensure contour_levels is a list of lists (one per member)
             if raw_contour_levels and not isinstance(raw_contour_levels[0], list):
                 contour_levels = [list(raw_contour_levels)]
             else:
                 contour_levels = [list(m_l) for m_l in raw_contour_levels]
 
+            for c_src in batched_sfc_sources:
+                c_cfg = {**param_config, **c_src}
+                _, levels = process_grib_to_array(
+                    None, c_cfg, want_raster=False, target_date=target_date, preloaded=preloaded
+                )
+                if levels and not isinstance(levels[0], list):
+                    levels = [levels]
+                for m_idx, m_lev in enumerate(levels):
+                    if m_idx < len(contour_levels):
+                        contour_levels[m_idx].extend(m_lev)
+                    else:
+                        contour_levels.append(m_lev)
+
             ptype_arr = None
 
-            try: os.remove(grib_file)
-            except Exception: pass
+            # 🌟 AIFS-ENS Specific Ptype Derivation (reuses batched 2t from sfc GRIB)
+            if need_prate_ptype:
+                t_pl_file = f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2"
+                try:
+                    t2m_dict = by_param.get("2t")
+                    t2m_arr = next(iter(t2m_dict.values())) if t2m_dict else None
 
-            # 🌟 AIFS-ENS Specific Ptype Derivation
-            ptype_source = param_config.get("ptype_source")
-            if ptype_source:
-                if param_config["id"] == "prate":
-                    t2m_file = f"{model_name}_{param_config['id']}_2t_{step:03d}.grib2"
-                    t_pl_file = f"{model_name}_{param_config['id']}_t_pl_{step:03d}.grib2"
-                    try:
-                        with tm("download_ptype"):
-                            client.retrieve(
-                                date=target_date, time=int(chosen_run), step=step, 
-                                stream="enfo", type="pf", levtype="sfc", param=["2t"], 
-                                number=MEMBER_LIST, target=t2m_file
-                            )
-                            client.retrieve(
-                                date=target_date, time=int(chosen_run), step=step, 
-                                stream="enfo", type="pf", levtype="pl", levelist=[850, 700, 500], param=["t"], 
-                                number=MEMBER_LIST, target=t_pl_file
-                            )
-                        
-                        if os.path.exists(t2m_file) and os.path.exists(t_pl_file):
-                            ds_2t = xr.open_dataset(t2m_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-                            if 'number' in ds_2t.coords: ds_2t = ds_2t.sortby('number')
-                            if 'lon' in ds_2t.coords: ds_2t = ds_2t.rename({'lon': 'longitude'})
-                            if 'lat' in ds_2t.coords: ds_2t = ds_2t.rename({'lat': 'latitude'})
-                            ds_2t = ds_2t.sortby('latitude', ascending=False)
-                            if ds_2t.longitude.max() > 180:
-                                ds_2t = ds_2t.assign_coords(longitude=(((ds_2t.longitude + 180) % 360) - 180)).sortby('longitude')
-                            ds_2t = ds_2t.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
-                                
-                            t2m_var = next(iter(ds_2t.data_vars))
-                            t2m_da = ds_2t[t2m_var].squeeze()
-                            
-                            ds_t = xr.open_dataset(t_pl_file, engine="cfgrib", backend_kwargs={'errors': 'ignore'})
-                            if 'number' in ds_t.coords: ds_t = ds_t.sortby('number')
-                            if 'lon' in ds_t.coords: ds_t = ds_t.rename({'lon': 'longitude'})
-                            if 'lat' in ds_t.coords: ds_t = ds_t.rename({'lat': 'latitude'})
-                            ds_t = ds_t.sortby('latitude', ascending=False)
-                            if ds_t.longitude.max() > 180:
-                                ds_t = ds_t.assign_coords(longitude=(((ds_t.longitude + 180) % 360) - 180)).sortby('longitude')
-                            ds_t = ds_t.sel(latitude=slice(NA_LAT_MAX, NA_LAT_MIN), longitude=slice(NA_LON_MIN, NA_LON_MAX))
-                                
-                            t_var = next(iter(ds_t.data_vars))
-                            t_pl_da = ds_t[t_var].squeeze()
-                            
-                            level_dim = next((dim for dim in t_pl_da.dims if 'isobaric' in dim.lower() or 'level' in dim.lower()), None)
-                            if level_dim:
-                                t_pl_da = t_pl_da.where((t_pl_da > 100) & (t_pl_da < 350))
-                                max_col_t = t_pl_da.max(dim=level_dim) 
-                            else:
-                                max_col_t = t_pl_da.max(dim=t_pl_da.dims[1])
-                                
-                            ptype_arr = np.zeros_like(t2m_da.values, dtype=np.uint8)
-                            
-                            rain_mask = t2m_da.values > 274.817
-                            ptype_arr[rain_mask] = 1
-                            
-                            surf_freeze = ~rain_mask
-                            warm_nose = max_col_t.values > 273.15
-                            
-                            ptype_arr[surf_freeze & warm_nose] = 3
-                            ptype_arr[surf_freeze & ~warm_nose] = 5
-                            
-                            if frame_arr is not None:
-                                ptype_arr[frame_arr == 0] = 0
-                            
-                            ds_2t.close()
-                            ds_t.close()
-                    except Exception as e:
-                        print(f"  ⚠️ [{param_config['id']}] AIFS Ptype derivation failed F{step:03d}: {e}")
-                    finally:
-                        if os.path.exists(t2m_file): 
-                            try: os.remove(t2m_file)
-                            except: pass
-                        if os.path.exists(t_pl_file): 
-                            try: os.remove(t_pl_file)
-                            except: pass
+                    if t2m_arr is not None and os.path.isdir(SHARED_2T_CACHE_DIR):
+                        cache_2t = _get_2t_cache_path(target_date, chosen_run, step)
+                        tmp_2t = os.path.join(SHARED_2T_CACHE_DIR, f".tmp_{step:03d}.npy")
+                        np.save(tmp_2t, t2m_arr)
+                        os.replace(tmp_2t, cache_2t)
 
-            if contour_sources:
-                for c_src in contour_sources:
+                    with tm("download_ptype"):
+                        client.retrieve(
+                            date=target_date, time=int(chosen_run), step=step,
+                            stream="enfo", type="pf", levtype="pl", levelist=[850, 700, 500], param=["t"],
+                            number=MEMBER_LIST, target=t_pl_file
+                        )
+
+                    if t2m_arr is not None and os.path.exists(t_pl_file):
+                        with tm("decode_all"):
+                            t_by_param, _, _ = read_grib_na(t_pl_file)
+                        t_pl_dict = t_by_param.get("t") or t_by_param[next(iter(t_by_param))]
+                        col_stack = np.stack([t_pl_dict[lvl] for lvl in sorted(t_pl_dict)], axis=0)
+                        max_col_t = np.max(np.where((col_stack > 100.0) & (col_stack < 350.0), col_stack, -np.inf), axis=0)
+
+                        ptype_arr = np.zeros(t2m_arr.shape, dtype=np.uint8)
+                        rain_mask = t2m_arr > 274.817
+                        ptype_arr[rain_mask] = 1
+
+                        surf_freeze = ~rain_mask
+                        warm_nose = max_col_t > 273.15
+                        ptype_arr[surf_freeze & warm_nose] = 3
+                        ptype_arr[surf_freeze & ~warm_nose] = 5
+
+                        if frame_arr is not None:
+                            ptype_arr[frame_arr == 0] = 0
+                except Exception as e:
+                    print(f"  ⚠️ [{param_config['id']}] AIFS Ptype derivation failed F{step:03d}: {e}")
+                finally:
+                    if os.path.exists(t_pl_file):
+                        try: os.remove(t_pl_file)
+                        except: pass
+
+            if remaining_contour_sources:
+                for c_src in remaining_contour_sources:
                     c_id = c_src.get("id", c_src.get("grib_param", "contour"))
                     c_grib_file = patterns["grib"].format(
                         model=model_name,
@@ -1146,30 +1240,41 @@ if __name__ == "__main__":
         else:
             target_params = ["2t"]
 
+    share_2t = ("prate" in target_params and "2t" in target_params)
+    if share_2t:
+        target_params = ["prate", "2t"] + [p for p in target_params if p not in ("prate", "2t")]
+        os.makedirs(SHARED_2T_CACHE_DIR, exist_ok=True)
+        batch_size = 1
+    else:
+        batch_size = MAX_CONCURRENT_PARAMS
+
     print(f"🚀 Launching Pipeline for Parameters: {target_params} | Range: {MEMBERS_STR}")
 
-    batch_size = MAX_CONCURRENT_PARAMS
     t_run = time.perf_counter()
 
-    for i in range(0, len(target_params), batch_size):
-        batch = target_params[i:i + batch_size]
-        batch_num = (i // batch_size) + 1
-        total_batches = math.ceil(len(target_params) / batch_size)
-        t_batch = time.perf_counter()
+    try:
+        for i in range(0, len(target_params), batch_size):
+            batch = target_params[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = math.ceil(len(target_params) / batch_size)
+            t_batch = time.perf_counter()
 
-        print(f"\n📦 [Batch {batch_num}/{total_batches}] Running {len(batch)} parameter(s) concurrently: {batch}")
+            print(f"\n📦 [Batch {batch_num}/{total_batches}] Running {len(batch)} parameter(s) concurrently: {batch}")
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=len(batch)) as executor:
-            futures = {executor.submit(run_master_pipeline, param): param for param in batch}
-            for future in concurrent.futures.as_completed(futures):
-                param = futures[future]
-                try:
-                    future.result()
-                    print(f"✅ Finished parameter: {param}")
-                except Exception as e:
-                    print(f"❌ Error processing parameter '{param}': {e}")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {executor.submit(run_master_pipeline, param): param for param in batch}
+                for future in concurrent.futures.as_completed(futures):
+                    param = futures[future]
+                    try:
+                        future.result()
+                        print(f"✅ Finished parameter: {param}")
+                    except Exception as e:
+                        print(f"❌ Error processing parameter '{param}': {e}")
 
-        print(f"⏱️ Batch {batch_num}/{total_batches} took {time.perf_counter() - t_batch:.1f}s", flush=True)
+            print(f"⏱️ Batch {batch_num}/{total_batches} took {time.perf_counter() - t_batch:.1f}s", flush=True)
+    finally:
+        if os.path.isdir(SHARED_2T_CACHE_DIR):
+            shutil.rmtree(SHARED_2T_CACHE_DIR, ignore_errors=True)
 
     print(f"\n🎉 ALL PARAMETERS COMPLETED FOR {MEMBERS_STR}!")
     
