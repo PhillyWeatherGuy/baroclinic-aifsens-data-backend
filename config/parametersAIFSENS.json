@@ -1,36 +1,5 @@
 {
   "parameters": {
-    "2t": {
-      "id": "2t",
-      "name": "2m Temperature",
-      "grib_param": "2t",
-      "levtype": "sfc",
-      "type": "fc",
-      "unit": "°F",
-      "scaling": {
-        "mode": "linear",
-        "min_val": 216.4833,
-        "max_val": 327.5944
-      },
-      "contours": [
-        {
-          "id": "freezing_32f",
-          "target": 273.15,
-          "name": "32°F Freezing Line",
-          "color": "#4169E1",
-          "width": 2.0,
-          "opacity": 0.95
-        }
-      ],
-      "filename_patterns": {
-        "grib": "{model}_{param}_{step:03d}.grib2",
-        "volume": "{model}_{param}_{date}_{run}_{members}_volume_{chunk_idx}.bin",
-        "run_contours": "{model}_{param}_{date}_{run}z_contours.json",
-        "latest_contours": "{model}_{param}_contours.json",
-        "run_manifest": "{model}_{param}_{date}_{run}_{members}_manifest.json",
-        "latest_manifest": "{model}_{param}_manifest.json"
-      }
-    },
     "prate": {
       "id": "prate",
       "name": "Surface Precipitation Rate",
@@ -38,7 +7,7 @@
       "interval_hours": 6,
       "levtype": "sfc",
       "type": "pf",
-      "ptype_source": "derived", 
+      "ptype_source": "derived",
       "unit": "in/hr",
       "scaling": {
         "mode": "piecewise",
@@ -96,6 +65,100 @@
           ]
         }
       ],
+      "filename_patterns": {
+        "grib": "{model}_{param}_{step:03d}.grib2",
+        "volume": "{model}_{param}_{date}_{run}_{members}_volume_{chunk_idx}.bin",
+        "run_contours": "{model}_{param}_{date}_{run}z_contours.json",
+        "latest_contours": "{model}_{param}_contours.json",
+        "run_manifest": "{model}_{param}_{date}_{run}_{members}_manifest.json",
+        "latest_manifest": "{model}_{param}_manifest.json"
+      }
+    },
+    "asnow": {
+      "id": "asnow",
+      "name": "Total Accumulated Snowfall",
+      "grib_param": "sf",
+      "levtype": "sfc",
+      "type": "pf",
+      "unit": "in",
+      "scaling": {
+        "mode": "piecewise",
+        "unit_multiplier": 0.393701,
+        "val_points": [0.0, 1.0, 10.0, 36.0, 150.0],
+        "byte_points": [0, 100, 200, 226, 255]
+      },
+      "contours": [],
+      "filename_patterns": {
+        "grib": "{model}_{param}_{step:03d}.grib2",
+        "volume": "{model}_{param}_{date}_{run}_{members}_volume_{chunk_idx}.bin",
+        "run_contours": "{model}_{param}_{date}_{run}z_contours.json",
+        "latest_contours": "{model}_{param}_contours.json",
+        "run_manifest": "{model}_{param}_{date}_{run}_{members}_manifest.json",
+        "latest_manifest": "{model}_{param}_manifest.json"
+      }
+    },
+    "asnow_24h": {
+      "id": "asnow_24h",
+      "name": "24-Hour Accumulated Snowfall",
+      "grib_param": "sf",
+      "interval_hours": 24,
+      "levtype": "sfc",
+      "type": "pf",
+      "unit": "in",
+      "scaling": {
+        "mode": "piecewise",
+        "unit_multiplier": 0.393701,
+        "val_points": [0.0, 1.0, 10.0, 36.0, 150.0],
+        "byte_points": [0, 100, 200, 226, 255]
+      },
+      "contours": [],
+      "filename_patterns": {
+        "grib": "{model}_{param}_{step:03d}.grib2",
+        "volume": "{model}_{param}_{date}_{run}_{members}_volume_{chunk_idx}.bin",
+        "run_contours": "{model}_{param}_{date}_{run}z_contours.json",
+        "latest_contours": "{model}_{param}_contours.json",
+        "run_manifest": "{model}_{param}_{date}_{run}_{members}_manifest.json",
+        "latest_manifest": "{model}_{param}_manifest.json"
+      }
+    },
+    "tp": {
+      "id": "tp",
+      "name": "Total Accumulated Precipitation",
+      "grib_param": "tp",
+      "levtype": "sfc",
+      "type": "pf",
+      "unit": "in",
+      "scaling": {
+        "mode": "piecewise",
+        "unit_multiplier": 0.0393701,
+        "val_points": [0.0, 1.0, 10.0, 50.0],
+        "byte_points": [0, 100, 200, 255]
+      },
+      "contours": [],
+      "filename_patterns": {
+        "grib": "{model}_{param}_{step:03d}.grib2",
+        "volume": "{model}_{param}_{date}_{run}_{members}_volume_{chunk_idx}.bin",
+        "run_contours": "{model}_{param}_{date}_{run}z_contours.json",
+        "latest_contours": "{model}_{param}_contours.json",
+        "run_manifest": "{model}_{param}_{date}_{run}_{members}_manifest.json",
+        "latest_manifest": "{model}_{param}_manifest.json"
+      }
+    },
+    "tp_24h": {
+      "id": "tp_24h",
+      "name": "24-Hour Accumulated Precipitation",
+      "grib_param": "tp",
+      "interval_hours": 24,
+      "levtype": "sfc",
+      "type": "pf",
+      "unit": "in",
+      "scaling": {
+        "mode": "piecewise",
+        "unit_multiplier": 0.0393701,
+        "val_points": [0.0, 1.0, 10.0, 50.0],
+        "byte_points": [0, 100, 200, 255]
+      },
+      "contours": [],
       "filename_patterns": {
         "grib": "{model}_{param}_{step:03d}.grib2",
         "volume": "{model}_{param}_{date}_{run}_{members}_volume_{chunk_idx}.bin",
