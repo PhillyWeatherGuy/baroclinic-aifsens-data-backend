@@ -64,8 +64,8 @@ MEMBERS_STR = f"m{MEMBER_LIST[0]:02d}-m{MEMBER_LIST[-1]:02d}"
 MEMBER_IDS = [f"m{i:02d}" for i in MEMBER_LIST]
 
 # 🌟 MANUAL RUN OVERRIDE (Set to None to automatically fetch the latest run)
-MANUAL_RUN_DATE = 20261119
-MANUAL_RUN_CYCLE = 18
+MANUAL_RUN_DATE = 20261120
+MANUAL_RUN_CYCLE = 00
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
 FORECAST_STEPS = list(range(0, 361, 6))
@@ -527,8 +527,8 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
     grib_var = param_config["grib_param"]
 
     if "u" in by_param and "v" in by_param:
-        u = np.squeeze(next(iter(by_param["u"].values())))
-        v = np.squeeze(next(iter(by_param["v"].values())))
+        u = next(iter(by_param["u"].values()))
+        v = next(iter(by_param["v"].values()))
 
         if param_config.get("id") == "pva":
             lat_rad = np.deg2rad(lats_na)
@@ -598,7 +598,7 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
     grib_p = param_config["grib_param"]
     is_interval = bool(param_config.get("interval_hours") or re.search(r'[-_]?(6|24)h(?:r)?$', param_config.get("id", "").lower()))
 
-    if step == 0 and param_config.get("grib_param") in {"tp", "sf"}:
+    if step == 0 and isinstance(grib_p, str) and grib_p in {"tp", "sf"}:
         zero_frame = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.float32 if is_interval else np.uint8)
         zero_ptype = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.uint8) if param_config.get("ptype_source") else None
         zero_packed = [pack_step([]) for _ in range(NUM_MEMBERS)]
