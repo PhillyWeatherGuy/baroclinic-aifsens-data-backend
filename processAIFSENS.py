@@ -149,21 +149,33 @@ def _to_slice_or_idx(idx):
             return slice(int(idx[0]), stop, -1)
     return idx
 
-def _get_na_crop(ni, nj, lat_first, lat_last, lon_first, lon_last):
+def _get_na_crop(gid, ni, nj, lat_first, lat_last, lon_first, lon_last):
     key = (ni, nj, round(lat_first, 6), round(lat_last, 6), round(lon_first, 6), round(lon_last, 6))
     cached = _NA_CROP_CACHE.get(key)
     if cached is not None:
         return cached
 
-    lats = np.linspace(lat_first, lat_last, nj)
+    try:
+        lats = np.asarray(eccodes.codes_get_array(gid, "distinctLatitudes"), dtype=np.float64)
+        lons = np.asarray(eccodes.codes_get_array(gid, "distinctLongitudes"), dtype=np.float64)
+        if len(lats) != nj or len(lons) != ni:
+            raise ValueError("grid axis length mismatch")
+    except Exception:
+        lats = np.linspace(lat_first, lat_last, nj)
+        dlon = (lon_last - lon_first) % 360.0
+        step_lon = dlon / (ni - 1) if ni > 1 else 0.0
+        lons = lon_first + np.arange(ni, dtype=np.float64) * step_lon
+
     lat_idx = np.flatnonzero((lats >= NA_LAT_MIN - 1e-6) & (lats <= NA_LAT_MAX + 1e-6))
     if len(lat_idx) > 1 and lats[lat_idx[0]] < lats[lat_idx[-1]]:
         lat_idx = lat_idx[::-1]
 
-    lons = np.linspace(lon_first, lon_last, ni)
     lons_180 = ((lons + 180.0) % 360.0) - 180.0
     lon_idx = np.flatnonzero((lons_180 >= NA_LON_MIN - 1e-6) & (lons_180 <= NA_LON_MAX + 1e-6))
     lon_idx = lon_idx[np.argsort(lons_180[lon_idx], kind="stable")]
+
+    if len(lat_idx) == 0 or len(lon_idx) == 0:
+        raise ValueError(f"Empty NA crop: lat_idx={len(lat_idx)}, lon_idx={len(lon_idx)}")
 
     lats_na = lats[lat_idx]
     lons_na = lons_180[lon_idx]
@@ -210,7 +222,7 @@ def read_grib_na(grib_path):
                     lon_last = float(eccodes.codes_get(gid, "longitudeOfLastGridPointInDegrees"))
 
                     lat_sel, lon_sel, ix, lats_na, lons_na, h_na, w_na = _get_na_crop(
-                        ni, nj, lat_first, lat_last, lon_first, lon_last
+                        gid, ni, nj, lat_first, lat_last, lon_first, lon_last
                     )
 
                     vals = eccodes.codes_get_values(gid).reshape(nj, ni)
@@ -527,7 +539,7 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
             dy = R * dlat
             dx = R * np.cos(lat_rad[:, None]) * dlon
 
-            dv_dx = np.gradient(v, axis=-1) / dx[-1]
+            dv_dx = np.gradient(v, axis=-1) / dx
             du_dy = -np.gradient(u, axis=-2) / dy
             raw_arr_k = dv_dx - du_dy
         else:
@@ -548,7 +560,7 @@ def process_grib_to_array(grib_path, param_config, want_raster=True, target_date
 
         clim = get_climatology_grid(param_config["id"], target_date, hgt.shape[-2:], unit=target_unit)
         if clim is None:
-            clim = np.tile(np.nanmean(hgt, axis=-2, keepdims=True), (1, 1, hgt.shape[-1])) if hgt.ndim == 3 else np.tile(np.nanmean(hgt, axis=1, keepdims=True), (1, hgt.shape[1]))
+            clim = np.tile(np.nanmean(hgt, axis=-1, keepdims=True), (1, 1, hgt.shape[-1])) if hgt.ndim == 3 else np.tile(np.nanmean(hgt, axis=1, keepdims=True), (1, hgt.shape[1]))
 
         raw_arr_k = hgt - clim
 
@@ -584,10 +596,11 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
     patterns = param_config["filename_patterns"]
     grib_file = patterns["grib"].format(model=model_name, param=param_config["id"], step=step)
     grib_p = param_config["grib_param"]
-    
-    if step == 0 and param_config.get("grib_param") == "tp":
-        zero_frame = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.float32)
-        zero_ptype = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.uint8)
+    is_interval = bool(param_config.get("interval_hours") or re.search(r'[-_]?(6|24)h(?:r)?$', param_config.get("id", "").lower()))
+
+    if step == 0 and param_config.get("grib_param") in {"tp", "sf"}:
+        zero_frame = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.float32 if is_interval else np.uint8)
+        zero_ptype = np.zeros((NUM_MEMBERS, NA_GRID_H, NA_GRID_W), dtype=np.uint8) if param_config.get("ptype_source") else None
         zero_packed = [pack_step([]) for _ in range(NUM_MEMBERS)]
         return step, zero_frame, zero_packed, zero_ptype
 
@@ -597,7 +610,6 @@ def fetch_and_process_step(client, target_date, chosen_run, step, param_config, 
 
     has_contours = bool(contour_sources)
     raster_config = {**param_config, "contours": []} if has_contours else param_config
-    is_interval = bool(param_config.get("interval_hours") or re.search(r'[-_]?(6|24)h(?:r)?$', param_config.get("id", "").lower()))
 
     # 🌟 Reuse cached 2t grid written by prate when available
     if param_config["id"] == "2t" and not contour_sources:
@@ -813,7 +825,7 @@ def build_volume_chunks(frame_arrays, steps_written, model_name, param_config, t
         chunk_steps = steps_written[i:i + frames_per_volume]
         chunk_ptype = ptype_arrays[i:i + frames_per_volume] if ptype_arrays else None
 
-        volume_arr = np.stack(chunk_frames, axis=0).transpose(1, 0, 2, 3)
+        volume_arr = np.stack(chunk_frames, axis=0).transpose(1, 0, 2, 3).astype(np.uint8)
         
         volume_filename = patterns[pattern_key].format(
             model=model_name,
@@ -970,7 +982,7 @@ def run_master_pipeline(selected_param_key="2t"):
             step, arr, packed, ptype_arr = future.result()
             if arr is not None:
                 results[step] = arr
-                if packed:
+                if packed and any(m.get("props") for m in packed):
                     contour_steps[step] = packed
                 if ptype_arr is not None:
                     ptype_results[step] = ptype_arr
