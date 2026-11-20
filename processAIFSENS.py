@@ -65,7 +65,7 @@ MEMBER_IDS = [f"m{i:02d}" for i in MEMBER_LIST]
 
 # 🌟 MANUAL RUN OVERRIDE (Set to None to automatically fetch the latest run)
 MANUAL_RUN_DATE = 20261119
-MANUAL_RUN_CYCLE = 0
+MANUAL_RUN_CYCLE = 18
 
 # 🌟 AIFS Ensemble: 6-hourly to F024
 FORECAST_STEPS = list(range(0, 361, 6))
